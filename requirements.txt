@@ -1,0 +1,32 @@
+# AffordGrasp - MSc Reproduction Project
+# Core Simulation
+pybullet>=3.2.5
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Vision & Image Processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+matplotlib>=3.7.0
+open3d>=0.17.0
+
+# VLM Affordance Reasoning
+openai>=1.12.0
+
+# Visual Grounding (LangSAM)
+# Note: Install separately - requires torch first
+# pip install lang-sam
+torch>=2.0.0
+torchvision>=0.15.0
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# Grasp Generation
+# AnyGrasp requires license from graspnet - see README
+# Alternative: graspnetAPI
+graspnetAPI>=1.0.0
+
+# Utilities
+trimesh>=3.23.0
+transforms3d>=0.4.1
+pyyaml>=6.0
+tqdm>=4.65.0
