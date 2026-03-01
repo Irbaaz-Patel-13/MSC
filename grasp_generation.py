@@ -25,7 +25,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 from scipy.spatial.transform import Rotation
 
-from .config import GraspConfig
+from config import GraspConfig
 
 
 @dataclass

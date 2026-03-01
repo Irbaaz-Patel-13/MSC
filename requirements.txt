@@ -1,32 +1,37 @@
 # AffordGrasp - MSc Reproduction Project
+# IMPORTANT: Requires Python 3.10–3.12. Python 3.13 is NOT supported (open3d has no 3.13 wheel).
+# Recommended: Python 3.11 (python3.11 -m venv .venv)
+
 # Core Simulation
+# NOTE: pybullet builds from source on Windows — requires MSVC Build Tools if no pre-built wheel is found.
+# Install from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 pybullet>=3.2.5
-numpy>=1.24.0
+numpy==1.26.4
 scipy>=1.10.0
 
 # Vision & Image Processing
 opencv-python>=4.8.0
 Pillow>=10.0.0
 matplotlib>=3.7.0
-open3d>=0.17.0
+open3d>=0.19.0  # 0.19.0 added Python 3.12 + NumPy 2 support; minimum for 3.11/3.12
 
 # VLM Affordance Reasoning
-openai>=1.12.0
+openai>=1.12.0,<2.0.0
 
 # Visual Grounding (LangSAM)
 # Note: Install separately - requires torch first
 # pip install lang-sam
-torch>=2.0.0
-torchvision>=0.15.0
+torch==2.4.1
+torchvision==0.19.1
 segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
 
 # Grasp Generation
 # AnyGrasp requires license from graspnet - see README
-# Alternative: graspnetAPI
-graspnetAPI>=1.0.0
+# The code uses antipodal sampling (no graspnetAPI import needed)
+# If you later integrate graspnetAPI, install separately:
+#   pip install "graspnetAPI==1.2.9" "transforms3d==0.3.1"
 
 # Utilities
 trimesh>=3.23.0
-transforms3d>=0.4.1
 pyyaml>=6.0
 tqdm>=4.65.0

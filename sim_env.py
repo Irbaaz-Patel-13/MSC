@@ -21,7 +21,7 @@ import pybullet_data
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from .config import SimulationConfig
+from config import SimulationConfig
 
 
 @dataclass

@@ -25,7 +25,7 @@ except ImportError:
     print("[Warning] openai package not installed. VLM reasoning will use mock mode.")
     OpenAI = None
 
-from .config import VLMConfig
+from config import VLMConfig
 
 
 @dataclass

@@ -21,7 +21,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from .config import VisualGroundingConfig
+from config import VisualGroundingConfig
 
 
 @dataclass

@@ -20,11 +20,11 @@ import numpy as np
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import asdict
 
-from modules.config import PipelineConfig
-from modules.sim_env import SimulationEnvironment, CapturedImage
-from modules.affordance_reasoning import AffordanceReasoner, FullReasoningResult
-from modules.visual_grounding import VisualAffordanceGrounder, GroundingResult
-from modules.grasp_generation import AffordanceGraspGenerator, GraspPose
+from config import PipelineConfig
+from sim_env import SimulationEnvironment, CapturedImage
+from affordance_reasoning import AffordanceReasoner, FullReasoningResult
+from visual_grounding import VisualAffordanceGrounder, GroundingResult
+from grasp_generation import AffordanceGraspGenerator, GraspPose
 
 
 class AffordGraspPipeline:
