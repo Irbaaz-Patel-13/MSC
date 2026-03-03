@@ -21,7 +21,7 @@ import pybullet_data
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from config import SimulationConfig
+from .config import SimulationConfig
 
 
 @dataclass
@@ -164,8 +164,7 @@ class SimulationEnvironment:
     
     def _set_home_position(self) -> None:
         """Set the robot to a neutral home position above the table."""
-        # UR5 joint angles for a typical home configuration
-        home_joints = [-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+        home_joints = list(self.config.home_joint_positions)
         num_joints = p.getNumJoints(self.robot_id)
         
         for i, angle in enumerate(home_joints[:min(6, num_joints)]):
@@ -174,6 +173,63 @@ class SimulationEnvironment:
     # =========================================================================
     #  OBJECT SPAWNING
     # =========================================================================
+    
+    def _try_load_ycb(self, category: str, position: np.ndarray,
+                      color: Tuple[float, ...]) -> Optional[SceneObject]:
+        """
+        Attempt to load a YCB mesh object. Returns None if unavailable.
+        Uses pybullet_object_models if installed, else returns None.
+        """
+        if not self.config.use_ycb_objects:
+            return None
+        
+        # Map category names to YCB model names
+        category_to_ycb = {
+            "mug": "YcbMug", "cup": "YcbMug",
+            "bowl": "YcbBowl",
+            "bottle": "YcbMustardBottle",
+            "hammer": "YcbHammer",
+            "knife": "YcbKnife",
+            "fork": "YcbFork",
+            "spoon": "YcbSpoon",
+            "scissors": "YcbScissors",
+            "pan": "YcbSkillet",
+        }
+        
+        ycb_name = category_to_ycb.get(category)
+        if ycb_name is None:
+            return None
+        
+        try:
+            from pybullet_object_models import ycb_objects
+            urdf_path = os.path.join(
+                ycb_objects.getDataPath(), ycb_name, "model.urdf"
+            )
+            if not os.path.exists(urdf_path):
+                return None
+            
+            spawn_pos = [position[0], position[1], position[2] + 0.05]
+            orientation = p.getQuaternionFromEuler(
+                [0, 0, np.random.uniform(0, 2 * np.pi)]
+            )
+            
+            body_id = p.loadURDF(urdf_path, spawn_pos, list(orientation))
+            
+            obj = SceneObject(
+                body_id=body_id,
+                name=f"ycb_{ycb_name}",
+                category=category,
+                position=np.array(spawn_pos),
+                orientation=np.array(orientation),
+                color=color
+            )
+            self.objects.append(obj)
+            return obj
+            
+        except ImportError:
+            return None
+        except Exception:
+            return None
     
     def spawn_primitive_object(
         self,
@@ -319,14 +375,16 @@ class SimulationEnvironment:
             num_distractors + 1, min_distance=0.08
         )
         
-        # Spawn target object at a random position
+        # Spawn target object at a random position (try YCB, fall back to primitive)
         target_idx = np.random.randint(len(positions))
-        target = self.spawn_primitive_object(
-            name=f"target_{target_category}",
-            category=target_category,
-            position=positions[target_idx],
-            color=colours[0]
-        )
+        target = self._try_load_ycb(target_category, positions[target_idx], colours[0])
+        if target is None:
+            target = self.spawn_primitive_object(
+                name=f"target_{target_category}",
+                category=target_category,
+                position=positions[target_idx],
+                color=colours[0]
+            )
         
         # Spawn distractors
         distractors = []
@@ -343,12 +401,14 @@ class SimulationEnvironment:
             if pos_idx >= len(positions):
                 break
             
-            obj = self.spawn_primitive_object(
-                name=f"distractor_{cat}_{i}",
-                category=cat,
-                position=positions[pos_idx],
-                color=colours[(i + 1) % len(colours)]
-            )
+            obj = self._try_load_ycb(cat, positions[pos_idx], colours[(i + 1) % len(colours)])
+            if obj is None:
+                obj = self.spawn_primitive_object(
+                    name=f"distractor_{cat}_{i}",
+                    category=cat,
+                    position=positions[pos_idx],
+                    color=colours[(i + 1) % len(colours)]
+                )
             distractors.append(obj)
             pos_idx += 1
         
@@ -450,10 +510,11 @@ class SimulationEnvironment:
         # Segmentation mask
         segmentation = np.array(seg_pixels, dtype=np.int32).reshape(height, width)
         
-        # Compute camera intrinsic matrix
-        fov_rad = np.deg2rad(self.config.camera_fov)
-        fx = width / (2.0 * np.tan(fov_rad / 2.0))
-        fy = fx  # square pixels
+        # Compute camera intrinsic matrix from the OpenGL projection matrix.
+        # PyBullet returns column-major (OpenGL convention) flat arrays.
+        proj_np = np.array(projection_matrix, dtype=np.float64).reshape(4, 4, order='F')
+        fx = proj_np[0, 0] * width / 2.0
+        fy = proj_np[1, 1] * height / 2.0
         cx = width / 2.0
         cy = height / 2.0
         intrinsics = np.array([
@@ -462,9 +523,9 @@ class SimulationEnvironment:
             [ 0,  0,  1]
         ], dtype=np.float64)
         
-        # Camera extrinsics (view matrix as 4x4)
-        view_4x4 = np.array(view_matrix, dtype=np.float64).reshape(4, 4).T
-        proj_4x4 = np.array(projection_matrix, dtype=np.float64).reshape(4, 4).T
+        # Camera extrinsics (view matrix as 4x4, column-major → standard row-major)
+        view_4x4 = np.array(view_matrix, dtype=np.float64).reshape(4, 4, order='F')
+        proj_4x4 = proj_np
         
         return CapturedImage(
             rgb=rgb,
@@ -528,12 +589,13 @@ class SimulationEnvironment:
             # Default: top-down grasp approach
             target_orientation = p.getQuaternionFromEuler([np.pi, 0, 0])
         
-        # Compute IK solution
+        # Compute IK solution — seeded with home rest poses for better convergence
         joint_positions = p.calculateInverseKinematics(
             self.robot_id,
             self.config.end_effector_index,
             list(target_position),
             list(target_orientation),
+            restPoses=list(self.config.home_joint_positions),
             maxNumIterations=100,
             residualThreshold=1e-5
         )
@@ -608,12 +670,33 @@ class SimulationEnvironment:
         print(f"[SimEnv] Lifting to: {lift_pos}")
         success = self.move_to_pose(lift_pos, grasp_orientation)
         
-        # Check if object was lifted
+        # Check grasp success: object lifted ≥5cm above table (paper's GSR criterion)
         if grasped_id is not None:
             obj_pos, _ = p.getBasePositionAndOrientation(grasped_id)
-            if obj_pos[2] > grasp_position[2] + 0.05:
-                print("[SimEnv] ✓ Grasp successful!")
-                return True
+            table_z = self.config.table_position[2] + self.config.table_size[2]
+            lifted = obj_pos[2] > table_z + 0.05
+            
+            if lifted:
+                # Stability check: simulate 50 more steps, verify drift < 2cm
+                pre_pos = np.array(obj_pos)
+                for _ in range(50):
+                    p.stepSimulation()
+                post_pos, _ = p.getBasePositionAndOrientation(grasped_id)
+                drift = np.linalg.norm(np.array(post_pos) - pre_pos)
+                stable = drift < 0.02
+                
+                # Also check persistent contact with gripper
+                contacts = p.getContactPoints(self.robot_id, grasped_id)
+                gripping = len(contacts) > 0
+                
+                if stable and gripping:
+                    print(f"[SimEnv] ✓ Grasp successful! "
+                          f"(lifted {obj_pos[2] - table_z:.3f}m, drift {drift:.4f}m)")
+                    return True
+                else:
+                    print(f"[SimEnv] ✗ Grasp unstable "
+                          f"(drift={drift:.4f}m, contact={gripping})")
+                    return False
         
         print("[SimEnv] ✗ Grasp failed.")
         return False
@@ -643,6 +726,10 @@ class SimulationEnvironment:
         """
         Convert depth image to 3D point cloud in world coordinates.
         
+        Handles the OpenGL camera convention used by PyBullet:
+        - Image frame: x-right, y-down, z-into-scene
+        - OpenGL camera: x-right, y-up, z-toward-viewer
+        
         Args:
             image_data: CapturedImage from capture_rgbd()
             mask: Optional binary mask to filter points (e.g., affordance region)
@@ -661,22 +748,28 @@ class SimulationEnvironment:
         
         # Apply mask if provided
         if mask is not None:
-            valid = (depth > 0) & (mask > 0)
+            valid = (depth > 0) & (depth < self.config.camera_far) & (mask > 0)
         else:
-            valid = depth > 0
+            valid = (depth > 0) & (depth < self.config.camera_far)
         
         u_valid = u[valid]
         v_valid = v[valid]
         z_valid = depth[valid]
         
-        # Back-project to camera frame
-        x_cam = (u_valid - cx) * z_valid / fx
-        y_cam = (v_valid - cy) * z_valid / fy
-        z_cam = z_valid
+        # Back-project to image-convention camera frame (x-right, y-down, z-forward)
+        x_img = (u_valid - cx) * z_valid / fx
+        y_img = (v_valid - cy) * z_valid / fy
+        z_img = z_valid
+        
+        # Convert to OpenGL camera frame (y-up, z-toward-viewer) to match
+        # the PyBullet view matrix convention
+        x_cam = x_img
+        y_cam = -y_img   # flip Y: image-down → OpenGL-up
+        z_cam = -z_img    # flip Z: into-scene → toward-viewer
         
         points_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)
         
-        # Transform to world frame
+        # Transform to world frame using inverse of view matrix
         extrinsics_inv = np.linalg.inv(image_data.camera_extrinsics)
         points_hom = np.hstack([points_cam, np.ones((len(points_cam), 1))])
         points_world = (extrinsics_inv @ points_hom.T).T[:, :3]

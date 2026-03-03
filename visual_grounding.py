@@ -21,7 +21,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from config import VisualGroundingConfig
+from .config import VisualGroundingConfig
 
 
 @dataclass
@@ -140,50 +140,84 @@ class VisualAffordanceGrounder:
         camera_intrinsics: Optional[np.ndarray],
         camera_extrinsics: Optional[np.ndarray]
     ) -> GroundingResult:
-        """Full LangSAM-based grounding matching the paper's approach."""
+        """
+        Full LangSAM-based grounding matching the paper's two-pass approach.
+        
+        Pass 1: Detect and segment the full target object.
+        Pass 2: Crop to the object bounding box (with padding), then detect
+                 the specific part within the crop. This isolates the part
+                 query from clutter distractors.
+        
+        Supports both LangSAM v0.1.x (single-image API) and v0.2.x (batched API).
+        """
         from PIL import Image
         
         pil_image = Image.fromarray(rgb_image)
         h, w = rgb_image.shape[:2]
+        pad = self.config.crop_padding
         
-        # Step 1: Segment the full target object
-        object_masks, object_boxes, _, object_scores = self.lang_sam.predict(
-            pil_image, target_object
-        )
+        # ---- Pass 1: Segment the full target object ----
+        # Use a short noun phrase with trailing period for best GroundingDINO results
+        object_query = f"{target_object}."
+        obj_result = self._langsam_predict(pil_image, object_query)
         
-        if len(object_masks) == 0:
+        if obj_result is None or len(obj_result["masks"]) == 0:
             print(f"[VisualGrounder] Warning: No object found for '{target_object}'")
             return self._empty_result(h, w, target_object, target_part)
         
         # Take the highest-confidence detection
-        best_idx = object_scores.argmax()
-        object_mask = object_masks[best_idx].numpy().astype(np.uint8)
-        obj_box = object_boxes[best_idx].numpy().astype(int)
+        best_idx = obj_result["scores"].argmax()
+        object_mask = obj_result["masks"][best_idx].astype(np.uint8)
+        obj_box_raw = obj_result["boxes"][best_idx]
         
-        # Step 2: Segment the target part within the object region
-        part_query = f"{target_part} of {target_object}"
-        part_masks, part_boxes, _, part_scores = self.lang_sam.predict(
-            pil_image, part_query
-        )
+        # Normalised boxes need denormalisation
+        if obj_box_raw.max() <= 1.0:
+            obj_box = [
+                int(obj_box_raw[0] * w), int(obj_box_raw[1] * h),
+                int(obj_box_raw[2] * w), int(obj_box_raw[3] * h)
+            ]
+        else:
+            obj_box = [int(v) for v in obj_box_raw]
         
-        if len(part_masks) > 0:
-            best_part_idx = part_scores.argmax()
-            part_mask = part_masks[best_part_idx].numpy().astype(np.uint8)
-            # Intersect with object mask to ensure part is within object
-            affordance_mask = (part_mask & object_mask).astype(np.uint8)
+        # ---- Pass 2: Crop and segment the part ----
+        # Crop to object bounding box with padding (research: 20px padding)
+        x1 = max(0, obj_box[0] - pad)
+        y1 = max(0, obj_box[1] - pad)
+        x2 = min(w, obj_box[2] + pad)
+        y2 = min(h, obj_box[3] + pad)
+        cropped = pil_image.crop((x1, y1, x2, y2))
+        
+        # Use short noun phrase for part — "handle.", "blade.", "rim."
+        part_query = f"{target_part}."
+        part_result = self._langsam_predict(cropped, part_query)
+        
+        if part_result is not None and len(part_result["masks"]) > 0:
+            best_part_idx = part_result["scores"].argmax()
+            part_mask_crop = part_result["masks"][best_part_idx].astype(np.uint8)
+            
+            # Map the cropped part mask back to full image coordinates
+            part_mask_full = np.zeros((h, w), dtype=np.uint8)
+            part_mask_full[y1:y2, x1:x2] = part_mask_crop
+            
+            # Intersect with object mask to ensure part is within the object
+            affordance_mask = (part_mask_full & object_mask).astype(np.uint8)
             
             if affordance_mask.sum() < self.config.min_mask_area:
-                # Part mask too small after intersection, fall back to heuristic
+                # Part mask too small after intersection — fall back to heuristic
+                print(f"[VisualGrounder] Part mask too small after intersection, "
+                      f"using heuristic for '{target_part}'")
                 affordance_mask = self._estimate_part_region(
                     object_mask, target_part
                 )
         else:
-            # No part found - estimate from object geometry
+            # No part found — estimate from object geometry
+            print(f"[VisualGrounder] No part detected for '{target_part}', "
+                  f"using heuristic estimate")
             affordance_mask = self._estimate_part_region(
                 object_mask, target_part
             )
         
-        # Compute affordance center
+        # Compute affordance center and bbox
         aff_center = self._compute_mask_center(affordance_mask)
         aff_bbox = self._mask_to_bbox(affordance_mask)
         
@@ -201,10 +235,54 @@ class VisualAffordanceGrounder:
             affordance_bbox=aff_bbox,
             affordance_center=aff_center if aff_center else (w // 2, h // 2),
             affordance_center_3d=center_3d,
-            confidence=float(object_scores[best_idx]),
+            confidence=float(obj_result["scores"][best_idx]),
             object_label=target_object,
             part_label=target_part
         )
+    
+    def _langsam_predict(self, pil_image, text_prompt: str) -> Optional[dict]:
+        """
+        Wrapper for LangSAM predict that handles both v0.1.x and v0.2.x APIs.
+        
+        Returns dict with keys: masks (N,H,W np.array), boxes (N,4), scores (N,).
+        """
+        import torch
+        
+        try:
+            # Try v0.2.x batched API first
+            results = self.lang_sam.predict([pil_image], [text_prompt])
+            if isinstance(results, list) and len(results) > 0:
+                r = results[0]
+                masks_t = r.get("masks", r.get("segmentation", torch.tensor([])))
+                boxes_t = r.get("boxes", torch.tensor([]))
+                scores_t = r.get("scores", r.get("logits", torch.tensor([])))
+                
+                if isinstance(masks_t, torch.Tensor) and masks_t.numel() > 0:
+                    return {
+                        "masks": masks_t.cpu().numpy(),
+                        "boxes": boxes_t.cpu().numpy(),
+                        "scores": scores_t.cpu().numpy()
+                    }
+        except TypeError:
+            pass  # v0.2.x API not supported, fall through
+        except Exception:
+            pass
+        
+        try:
+            # Fall back to v0.1.x single-image API
+            masks, boxes, phrases, logits = self.lang_sam.predict(
+                pil_image, text_prompt
+            )
+            if isinstance(masks, torch.Tensor) and masks.numel() > 0:
+                return {
+                    "masks": masks.cpu().numpy(),
+                    "boxes": boxes.cpu().numpy(),
+                    "scores": logits.cpu().numpy()
+                }
+        except Exception as e:
+            print(f"[VisualGrounder] LangSAM predict failed: {e}")
+        
+        return None
     
     # =========================================================================
     #  Method 2: Simulation Segmentation Fallback
@@ -416,27 +494,31 @@ class VisualAffordanceGrounder:
         """
         Convert a pixel coordinate + depth to a 3D world coordinate.
         
-        This is used to compute the 3D affordance center, which is then
-        used to filter and rank grasp poses.
+        Applies the OpenGL camera convention flip (y-down → y-up, z-forward → z-back)
+        to match PyBullet's view matrix convention before transforming to world frame.
         """
-        cx, cy = pixel
+        cx_px, cy_px = pixel
         
         # Clamp to image bounds
         h, w = depth.shape
-        cy = max(0, min(cy, h - 1))
-        cx = max(0, min(cx, w - 1))
+        cy_px = max(0, min(cy_px, h - 1))
+        cx_px = max(0, min(cx_px, w - 1))
         
-        z = float(depth[cy, cx])
-        if z <= 0 or z > 2.0:
+        z = float(depth[cy_px, cx_px])
+        if z <= 0 or z > 5.0:
             return None
         
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         px, py = intrinsics[0, 2], intrinsics[1, 2]
         
-        # Back-project to camera frame
-        x_cam = (cx - px) * z / fx
-        y_cam = (cy - py) * z / fy
-        z_cam = z
+        # Back-project to image-convention camera frame
+        x_img = (cx_px - px) * z / fx
+        y_img = (cy_px - py) * z / fy
+        
+        # Convert to OpenGL camera frame (PyBullet view matrix convention)
+        x_cam = x_img
+        y_cam = -y_img   # flip Y
+        z_cam = -z        # flip Z
         
         point_cam = np.array([x_cam, y_cam, z_cam, 1.0])
         
@@ -447,6 +529,45 @@ class VisualAffordanceGrounder:
             return point_world[:3]
         
         return point_cam[:3]
+    
+    def compute_affordance_center_3d_from_mask(
+        self,
+        affordance_mask: np.ndarray,
+        depth: np.ndarray,
+        intrinsics: np.ndarray,
+        extrinsics: Optional[np.ndarray] = None
+    ) -> Optional[np.ndarray]:
+        """
+        Compute the 3D affordance centre as the mean of all masked 3D points.
+        
+        This is more robust than single-pixel back-projection because it
+        averages over the entire affordance region, reducing noise from
+        any single depth measurement.
+        """
+        h, w = depth.shape
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        
+        valid = (affordance_mask > 0) & (depth > 0.01) & (depth < 5.0)
+        if valid.sum() == 0:
+            return None
+        
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        px, py = intrinsics[0, 2], intrinsics[1, 2]
+        
+        z_vals = depth[valid]
+        x_img = (u[valid] - px) * z_vals / fx
+        y_img = (v[valid] - py) * z_vals / fy
+        
+        # OpenGL convention flip
+        points_cam = np.stack([x_img, -y_img, -z_vals, np.ones_like(z_vals)], axis=-1)
+        
+        if extrinsics is not None:
+            extrinsics_inv = np.linalg.inv(extrinsics)
+            points_world = (extrinsics_inv @ points_cam.T).T[:, :3]
+        else:
+            points_world = points_cam[:, :3]
+        
+        return points_world.mean(axis=0)
     
     def _empty_result(
         self, h: int, w: int, object_label: str, part_label: str

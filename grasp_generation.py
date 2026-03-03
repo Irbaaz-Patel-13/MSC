@@ -2,20 +2,17 @@
 Task-Oriented Grasp Generation Module
 ======================================
 Generates 6-DoF grasp poses within the affordance region identified by the
-visual grounding module. The paper uses AnyGrasp for this step; since AnyGrasp
-requires a commercial license, this module provides an antipodal grasp sampling
-alternative that follows the same principle: generate candidate grasps across
-the point cloud and rank them by proximity to the affordance center.
+visual grounding module.
 
-Key Concept (from paper):
-    "We employ AnyGrasp to generate 6D grasp poses, aligning the affordance 
-     center to select the optimal grasp."
-    
-The affordance-guided selection means:
-1. Generate many candidate grasps on the point cloud
-2. Filter to grasps within the affordance mask region
-3. Rank by combined score: affordance_proximity * quality_score
-4. Select the top-K grasps
+Primary method: Contact-GraspNet (PyTorch port by elchun) — open-source 6-DoF
+grasp detection from depth/point cloud input, no license required.
+Fallback: Antipodal grasp sampling on the point cloud.
+
+The key AffordGrasp insight is the ranking formula:
+    ranking(g) = score(g) / ||t(g) - c||₂
+where t(g) is the grasp translation, c is the 3D affordance centre, and
+score(g) is the grasp confidence. This naturally biases selection toward
+high-quality grasps near the task-relevant part.
 
 Reference: AffordGrasp, Section III-C: Task-Oriented Grasp Generation
 """
@@ -25,7 +22,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 from scipy.spatial.transform import Rotation
 
-from config import GraspConfig
+from .config import GraspConfig
 
 
 @dataclass
@@ -52,27 +49,66 @@ class AffordanceGraspGenerator:
     """
     Generates task-oriented grasp poses guided by affordance information.
     
-    The pipeline mirrors AnyGrasp's approach:
-    1. Sample candidate grasps on the point cloud (antipodal sampling)
-    2. Evaluate grasp quality (force closure approximation)
-    3. Filter by affordance region (only keep grasps in affordance mask)
-    4. Rank by combined affordance proximity + quality score
-    5. Return top-K grasps
+    Primary: Contact-GraspNet (PyTorch port) for 6-DoF grasp detection.
+    Fallback: Antipodal grasp sampling on the point cloud.
+    
+    Both methods are followed by the AffordGrasp ranking formula:
+        ranking(g) = score(g) / max(||t(g) - c||₂, ε)
     
     Usage:
         config = GraspConfig()
         generator = AffordanceGraspGenerator(config)
         grasps = generator.generate(
             point_cloud=points,
-            affordance_mask_3d=aff_points,
-            affordance_center_3d=center,
-            surface_normals=normals
+            affordance_center_3d=center
         )
     """
     
     def __init__(self, config: GraspConfig):
         self.config = config
         self.rng = np.random.RandomState(42)
+        self.cgn_model = None
+        
+        # Try to load Contact-GraspNet if configured
+        if config.method == "contact_graspnet":
+            self._try_load_contact_graspnet()
+    
+    def _try_load_contact_graspnet(self) -> None:
+        """Attempt to load Contact-GraspNet PyTorch model."""
+        try:
+            from contact_graspnet_pytorch.contact_graspnet import (
+                ContactGraspNet, load_config as cgn_load_config
+            )
+            import torch
+            
+            cgn_config = cgn_load_config(self.config.cgn_checkpoint_dir)
+            self.cgn_model = ContactGraspNet(cgn_config)
+            
+            # Load checkpoint
+            import glob
+            ckpt_files = glob.glob(
+                f"{self.config.cgn_checkpoint_dir}/*.pt"
+            ) + glob.glob(
+                f"{self.config.cgn_checkpoint_dir}/*.pth"
+            )
+            if ckpt_files:
+                ckpt = torch.load(ckpt_files[0], map_location="cuda")
+                self.cgn_model.load_state_dict(ckpt)
+                self.cgn_model.cuda().eval()
+                print("[GraspGen] Contact-GraspNet loaded successfully.")
+            else:
+                print(f"[GraspGen] No checkpoint found in {self.config.cgn_checkpoint_dir}")
+                self.cgn_model = None
+                
+        except ImportError:
+            print("[GraspGen] contact_graspnet_pytorch not installed.")
+            print("  Install: pip install -e . from the contact_graspnet_pytorch repo")
+            print("  Falling back to antipodal sampling.")
+            self.cgn_model = None
+        except Exception as e:
+            print(f"[GraspGen] Contact-GraspNet load failed: {e}")
+            print("  Falling back to antipodal sampling.")
+            self.cgn_model = None
     
     def generate(
         self,
@@ -80,7 +116,10 @@ class AffordanceGraspGenerator:
         affordance_center_3d: np.ndarray,
         affordance_points: Optional[np.ndarray] = None,
         surface_normals: Optional[np.ndarray] = None,
-        table_height: float = 0.0
+        table_height: float = 0.0,
+        depth_image: Optional[np.ndarray] = None,
+        camera_intrinsics: Optional[np.ndarray] = None,
+        segmentation_mask: Optional[np.ndarray] = None,
     ) -> List[GraspPose]:
         """
         Generate task-oriented grasp poses.
@@ -91,9 +130,12 @@ class AffordanceGraspGenerator:
             affordance_points: (M, 3) point cloud of the affordance region only
             surface_normals: (N, 3) surface normals (estimated if None)
             table_height: Height of the table surface for collision filtering
+            depth_image: (H, W) depth in metres (for Contact-GraspNet)
+            camera_intrinsics: (3, 3) camera matrix K (for Contact-GraspNet)
+            segmentation_mask: (H, W) affordance mask (for Contact-GraspNet)
         
         Returns:
-            List of GraspPose objects sorted by combined_score (best first)
+            List of GraspPose objects sorted by affordance-aware ranking (best first)
         """
         # Use affordance points if available, else use full cloud
         grasp_cloud = affordance_points if affordance_points is not None else point_cloud
@@ -102,48 +144,52 @@ class AffordanceGraspGenerator:
             print("[GraspGen] Warning: Too few points for grasp generation.")
             return []
         
-        # Estimate normals if not provided
-        if surface_normals is None:
-            surface_normals = self._estimate_normals(grasp_cloud)
-        elif affordance_points is not None:
-            # Need normals for affordance points specifically
-            surface_normals = self._estimate_normals(affordance_points)
-        
-        # Step 1: Sample candidate grasps
-        candidates = self._sample_antipodal_grasps(
-            grasp_cloud, surface_normals
-        )
+        # ---- Generate candidate grasps ----
+        if self.cgn_model is not None and depth_image is not None:
+            candidates = self._generate_contact_graspnet(
+                depth_image, camera_intrinsics, segmentation_mask
+            )
+        else:
+            # Fallback: antipodal sampling
+            if surface_normals is None:
+                surface_normals = self._estimate_normals(grasp_cloud)
+            elif affordance_points is not None:
+                surface_normals = self._estimate_normals(affordance_points)
+            
+            candidates = self._sample_antipodal_grasps(grasp_cloud, surface_normals)
+            
+            # Evaluate quality for antipodal grasps
+            for grasp in candidates:
+                grasp.quality_score = self._evaluate_quality(grasp, grasp_cloud)
         
         if len(candidates) == 0:
             print("[GraspGen] Warning: No valid grasp candidates generated.")
             return []
         
-        # Step 2: Evaluate quality
-        for grasp in candidates:
-            grasp.quality_score = self._evaluate_quality(grasp, grasp_cloud)
+        # ---- AffordGrasp ranking: score / distance ----
+        # This is the paper's core contribution to grasp selection.
+        eps = self.config.min_distance_epsilon
+        max_dist = self.config.max_distance_from_affordance_center
         
-        # Step 3: Compute affordance scores
         for grasp in candidates:
-            grasp.affordance_score = self._compute_affordance_score(
-                grasp, affordance_center_3d
-            )
+            distance = np.linalg.norm(grasp.position - affordance_center_3d)
+            grasp.affordance_score = distance  # store raw distance for logging
+            
+            if distance > max_dist:
+                grasp.combined_score = 0.0  # hard cutoff
+            else:
+                # Paper formula: ranking = score / distance
+                grasp.combined_score = grasp.quality_score / max(distance, eps)
         
-        # Step 4: Compute combined scores
-        aw = self.config.affordance_weight
-        qw = self.config.quality_weight
-        for grasp in candidates:
-            grasp.combined_score = (
-                aw * grasp.affordance_score + qw * grasp.quality_score
-            )
-        
-        # Step 5: Filter and sort
-        # Remove grasps too close to table
+        # ---- Filter and sort ----
+        # Remove grasps below table
         candidates = [
-            g for g in candidates
-            if g.position[2] > table_height + 0.01
+            g for g in candidates if g.position[2] > table_height + 0.01
         ]
+        # Remove zero-scored grasps (beyond max distance)
+        candidates = [g for g in candidates if g.combined_score > 0.0]
         
-        # Sort by combined score
+        # Sort by AffordGrasp ranking (highest first)
         candidates.sort(key=lambda g: g.combined_score, reverse=True)
         
         # Return top-K
@@ -152,10 +198,83 @@ class AffordanceGraspGenerator:
         if top_grasps:
             print(f"[GraspGen] Generated {len(candidates)} candidates, "
                   f"returning top {len(top_grasps)}")
-            print(f"  Best grasp: pos={top_grasps[0].position}, "
-                  f"score={top_grasps[0].combined_score:.3f}")
+            best = top_grasps[0]
+            print(f"  Best grasp: pos={best.position}, "
+                  f"score={best.quality_score:.3f}, "
+                  f"dist_to_aff={best.affordance_score:.4f}, "
+                  f"ranking={best.combined_score:.3f}")
         
         return top_grasps
+    
+    # =========================================================================
+    #  CONTACT-GRASPNET INFERENCE
+    # =========================================================================
+    
+    def _generate_contact_graspnet(
+        self,
+        depth: np.ndarray,
+        intrinsics: np.ndarray,
+        segmask: Optional[np.ndarray] = None
+    ) -> List[GraspPose]:
+        """
+        Generate grasps using Contact-GraspNet.
+        
+        Input: depth map + camera intrinsics + optional segmentation mask.
+        Output: list of GraspPose with quality_score from the network.
+        
+        Contact-GraspNet returns per-segment grasp predictions as:
+          pred_grasps_cam[seg_id] → (N, 4, 4) homogeneous transforms
+          scores[seg_id] → (N,) confidence scores
+          contact_pts[seg_id] → (N, 3) contact points
+        """
+        try:
+            from contact_graspnet_pytorch import inference as cgn_inference
+            import torch
+            
+            # Prepare input dict
+            pc_full, pc_segments, _ = cgn_inference.extract_point_clouds(
+                depth, intrinsics,
+                segmap=segmask if segmask is not None else np.ones_like(depth, dtype=np.int32),
+                z_range=list(self.config.cgn_z_range)
+            )
+            
+            pred_grasps, scores, contact_pts, _ = cgn_inference.predict_grasps(
+                self.cgn_model, pc_full, pc_segments,
+                forward_passes=self.config.cgn_forward_passes,
+                filter_grasps=self.config.cgn_filter_grasps
+            )
+            
+            # Convert to GraspPose objects
+            candidates = []
+            for seg_id in pred_grasps:
+                poses_4x4 = pred_grasps[seg_id]     # (N, 4, 4)
+                seg_scores = scores[seg_id]           # (N,)
+                
+                for i in range(len(poses_4x4)):
+                    T = poses_4x4[i]
+                    rot = T[:3, :3]
+                    pos = T[:3, 3]
+                    quat = Rotation.from_matrix(rot).as_quat()
+                    approach = rot[:, 2]  # z-axis is approach
+                    
+                    candidates.append(GraspPose(
+                        position=pos,
+                        orientation=quat,
+                        rotation_matrix=rot,
+                        width=0.08,  # Robotiq-85 default
+                        quality_score=float(seg_scores[i]),
+                        affordance_score=0.0,
+                        combined_score=0.0,
+                        approach_direction=approach
+                    ))
+            
+            print(f"[GraspGen] Contact-GraspNet produced {len(candidates)} grasps")
+            return candidates
+            
+        except Exception as e:
+            print(f"[GraspGen] Contact-GraspNet inference failed: {e}")
+            print("  Falling back to antipodal sampling on available point cloud.")
+            return []
     
     # =========================================================================
     #  ANTIPODAL GRASP SAMPLING

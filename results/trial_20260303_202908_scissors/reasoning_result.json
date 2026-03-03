@@ -1,0 +1,6 @@
+{
+  "task_goal": "Cut or slice objects",
+  "target_object": "knife or scissors",
+  "optimal_part": "handle",
+  "approach": "side"
+}

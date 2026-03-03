@@ -1,0 +1,6 @@
+{
+  "task_goal": "Drink a beverage",
+  "target_object": "drinking vessel",
+  "optimal_part": "body",
+  "approach": "top"
+}

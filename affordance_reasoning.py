@@ -16,6 +16,7 @@ import json
 import base64
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+from collections import Counter
 
 import numpy as np
 
@@ -25,7 +26,40 @@ except ImportError:
     print("[Warning] openai package not installed. VLM reasoning will use mock mode.")
     OpenAI = None
 
-from config import VLMConfig
+try:
+    from pydantic import BaseModel as PydanticBaseModel
+    
+    # Pydantic schemas for Structured Outputs (guaranteed JSON via constrained decoding)
+    class TaskAnalysisSchema(PydanticBaseModel):
+        task_goal: str
+        functional_requirements: list[str]
+        required_object_type: str
+        required_properties: list[str]
+    
+    class ObjectIdentificationSchema(PydanticBaseModel):
+        target_object: str
+        object_description: str
+        confidence: float
+        approximate_location: str
+    
+    class ObjectPartSchema(PydanticBaseModel):
+        part_name: str
+        function: str
+        graspable: bool
+        affordance_for_task: str
+    
+    class AffordanceReasoningSchema(PydanticBaseModel):
+        object_parts: list[ObjectPartSchema]
+        optimal_grasp_part: str
+        grasp_reasoning: str
+        grasp_approach: str
+    
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+    print("[Warning] pydantic not installed. Structured Outputs disabled; using JSON parsing.")
+
+from .config import VLMConfig
 
 
 @dataclass
@@ -179,7 +213,8 @@ class AffordanceReasoner:
             instruction=instruction
         )
         
-        response = self._call_vlm(prompt, image=None)
+        schema = TaskAnalysisSchema if PYDANTIC_AVAILABLE else None
+        response = self._call_vlm(prompt, image=None, response_schema=schema)
         data = self._parse_json_response(response)
         
         return TaskAnalysisResult(
@@ -202,6 +237,9 @@ class AffordanceReasoner:
         """
         Identify the most suitable object in the scene for the given task.
         Uses the scene image + task analysis to ground the object visually.
+        
+        When n_consensus_samples > 1, queries the VLM multiple times and
+        takes the majority-vote object to reduce hallucination risk.
         """
         if self.mock_mode:
             return self._mock_object_identification(task_result)
@@ -212,8 +250,41 @@ class AffordanceReasoner:
             required_object_type=task_result.required_object_type
         )
         
-        response = self._call_vlm(prompt, image=scene_image)
-        data = self._parse_json_response(response)
+        schema = ObjectIdentificationSchema if PYDANTIC_AVAILABLE else None
+        n_samples = self.config.n_consensus_samples
+        
+        if n_samples <= 1:
+            # Single query
+            response = self._call_vlm(prompt, image=scene_image,
+                                      response_schema=schema)
+            data = self._parse_json_response(response)
+        else:
+            # Consensus querying: query n times, take majority vote on object
+            all_results = []
+            for i in range(n_samples):
+                response = self._call_vlm(prompt, image=scene_image,
+                                          response_schema=schema)
+                data_i = self._parse_json_response(response)
+                if data_i.get("target_object"):
+                    all_results.append(data_i)
+            
+            if not all_results:
+                print("[AffordanceReasoner] All consensus queries failed.")
+                data = {}
+            else:
+                # Majority vote on target_object
+                objects = [r["target_object"].lower().strip() for r in all_results]
+                vote = Counter(objects).most_common(1)[0]
+                if vote[1] < 2 and n_samples >= 3:
+                    print(f"[AffordanceReasoner] Warning: No consensus "
+                          f"(objects: {objects}). Using first response.")
+                # Pick the first result that matches the majority object
+                majority_obj = vote[0]
+                data = next(
+                    (r for r in all_results
+                     if r["target_object"].lower().strip() == majority_obj),
+                    all_results[0]
+                )
         
         return ObjectIdentificationResult(
             target_object=data.get("target_object", ""),
@@ -250,7 +321,8 @@ class AffordanceReasoner:
             functional_requirements=", ".join(task_result.functional_requirements)
         )
         
-        response = self._call_vlm(prompt, image=None)
+        schema = AffordanceReasoningSchema if PYDANTIC_AVAILABLE else None
+        response = self._call_vlm(prompt, image=None, response_schema=schema)
         data = self._parse_json_response(response)
         
         return AffordanceReasoningResult(
@@ -265,14 +337,22 @@ class AffordanceReasoner:
     #  VLM API CALLS
     # =========================================================================
     
-    def _call_vlm(self, prompt: str, image: Optional[np.ndarray] = None) -> str:
-        """Make a call to GPT-4o with optional image input."""
+    def _call_vlm(
+        self, prompt: str, image: Optional[np.ndarray] = None,
+        response_schema=None
+    ) -> str:
+        """
+        Make a call to GPT-4o with optional image input.
+        
+        If response_schema is a Pydantic model and config.use_structured_outputs
+        is True, uses the Structured Outputs API for guaranteed JSON compliance.
+        Otherwise falls back to standard completion with manual JSON parsing.
+        """
         messages = [
             {"role": "system", "content": self.config.system_prompt}
         ]
         
         if image is not None:
-            # Encode image as base64
             image_b64 = self._encode_image(image)
             messages.append({
                 "role": "user",
@@ -281,7 +361,7 @@ class AffordanceReasoner:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{image_b64}",
-                            "detail": "high"
+                            "detail": self.config.image_detail
                         }
                     },
                     {"type": "text", "text": prompt}
@@ -290,6 +370,25 @@ class AffordanceReasoner:
         else:
             messages.append({"role": "user", "content": prompt})
         
+        # Use Structured Outputs when available — guarantees valid JSON
+        if (response_schema is not None
+                and self.config.use_structured_outputs
+                and PYDANTIC_AVAILABLE):
+            try:
+                response = self.client.beta.chat.completions.parse(
+                    model=self.config.model_name,
+                    messages=messages,
+                    response_format=response_schema,
+                    max_tokens=self.config.max_tokens,
+                    temperature=self.config.temperature
+                )
+                parsed = response.choices[0].message.parsed
+                return json.dumps(parsed.model_dump())
+            except Exception as e:
+                print(f"[AffordanceReasoner] Structured Output failed: {e}")
+                print("  Falling back to standard completion.")
+        
+        # Standard completion with manual JSON parsing
         response = self.client.chat.completions.create(
             model=self.config.model_name,
             messages=messages,

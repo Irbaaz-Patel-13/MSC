@@ -21,11 +21,13 @@ class SimulationConfig:
     time_step: float = 1.0 / 240.0
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     
-    # UR5 Robot
-    robot_urdf: str = "ur5/ur5.urdf"  # PyBullet data path
+    # UR5 Robot — use pybullet_ur5_robotiq URDF for UR5 + Robotiq-85
+    robot_urdf: str = "ur5/ur5.urdf"  # PyBullet data path (fallback)
     robot_base_position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     robot_base_orientation: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
-    end_effector_index: int = 7  # UR5 EE link index
+    end_effector_index: int = 7  # UR5 EE link (verify against your URDF)
+    # Home joint configuration for UR5
+    home_joint_positions: Tuple = (-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0)
     
     # Gripper
     gripper_type: str = "robotiq_85"  # or "simple_gripper"
@@ -41,15 +43,19 @@ class SimulationConfig:
         "z": (0.02, 0.30),
     })
     
-    # Camera (eye-to-hand, top-down view matching paper)
-    camera_position: Tuple[float, float, float] = (0.5, 0.0, 0.8)
+    # Camera (eye-to-hand, matching paper's RealSense L515 setup)
+    camera_position: Tuple[float, float, float] = (0.5, 0.0, 1.2)
     camera_target: Tuple[float, float, float] = (0.5, 0.0, 0.0)
     camera_up_vector: Tuple[float, float, float] = (0.0, 1.0, 0.0)
     image_width: int = 640
     image_height: int = 480
     camera_fov: float = 60.0
     camera_near: float = 0.01
-    camera_far: float = 2.0
+    camera_far: float = 5.0  # extended for wider depth range
+    
+    # Object loading: use YCB meshes when available, primitives as fallback
+    use_ycb_objects: bool = True
+    ycb_data_path: str = ""  # auto-detected from pybullet_object_models if installed
     
     # Clutter settings
     num_distractor_objects: int = 5
@@ -63,10 +69,20 @@ class SimulationConfig:
 @dataclass
 class VLMConfig:
     """Vision-Language Model configuration for affordance reasoning."""
-    model_name: str = "gpt-4o"
+    model_name: str = "gpt-4o-2024-08-06"  # supports Structured Outputs
     api_key: str = ""  # Set via environment variable OPENAI_API_KEY
-    max_tokens: int = 1024
-    temperature: float = 0.2
+    max_tokens: int = 512
+    temperature: float = 0.3
+    
+    # Structured Outputs — uses Pydantic models for guaranteed JSON schema
+    use_structured_outputs: bool = True
+    
+    # Robust consensus querying — query VLM n times, take majority vote
+    n_consensus_samples: int = 3
+    
+    # Image detail level: "high" (~850 tokens, better accuracy) or
+    # "low" (85 tokens, ~$0.001/call vs ~$0.004/call)
+    image_detail: str = "high"
     
     # Prompt templates for three-step reasoning
     system_prompt: str = """You are an expert robotic manipulation assistant. 
@@ -136,22 +152,24 @@ Respond in JSON format:
 
 @dataclass
 class VisualGroundingConfig:
-    """LangSAM visual grounding module configuration."""
-    # SAM model
-    sam_model_type: str = "vit_h"
-    sam_checkpoint: str = "sam_vit_h_4b8939.pth"
+    """LangSAM visual grounding module configuration (v0.2.x API)."""
+    # LangSAM model variant — sam2.1 variants: "sam2.1_hiera_tiny" (4GB),
+    # "sam2.1_hiera_small" (default, ~6GB), "sam2.1_hiera_large" (~10GB)
+    sam_variant: str = "sam2.1_hiera_small"
     
-    # Grounding DINO
-    grounding_dino_model: str = "groundingdino_swinb_cogcoor"
+    # GroundingDINO detection thresholds
     box_threshold: float = 0.3
     text_threshold: float = 0.25
     
+    # Two-pass grounding: crop padding around detected object bbox (pixels)
+    crop_padding: int = 20
+    
     # Segmentation refinement
-    mask_threshold: float = 0.5
     min_mask_area: int = 100  # minimum pixel area for valid mask
     
-    # Image processing
-    input_size: Tuple[int, int] = (224, 224)  # Paper uses 224x224 for segmentation
+    # Image processing — paper uses 224x224 for affordance segmentation,
+    # but LangSAM works best at native resolution (no resize needed)
+    resize_for_segmentation: bool = False
     
     # Device
     device: str = "cuda"  # or "cpu"
@@ -160,23 +178,29 @@ class VisualGroundingConfig:
 @dataclass
 class GraspConfig:
     """Grasp generation configuration."""
-    # AnyGrasp parameters (or alternative grasp sampler)
-    method: str = "antipodal_sampling"  # "anygrasp" requires license
+    # Method: "contact_graspnet" (recommended open-source) or "antipodal" (fallback)
+    method: str = "contact_graspnet"
     
-    # Antipodal grasp sampling parameters
+    # Contact-GraspNet configuration (PyTorch port by elchun)
+    cgn_checkpoint_dir: str = "checkpoints/contact_graspnet"
+    cgn_forward_passes: int = 5   # number of stochastic forward passes
+    cgn_z_range: Tuple[float, float] = (0.2, 1.8)  # depth range filter (metres)
+    cgn_local_regions: bool = True  # per-segment grasp generation
+    cgn_filter_grasps: bool = True  # collision filtering
+    
+    # Antipodal sampling fallback parameters
     num_grasp_samples: int = 200
     friction_coefficient: float = 0.5
     grasp_width_range: Tuple[float, float] = (0.02, 0.085)
     grasp_depth: float = 0.02
-    
-    # Affordance-guided filtering
-    affordance_weight: float = 0.7  # weight for affordance center proximity
-    quality_weight: float = 0.3     # weight for grasp quality score
-    max_distance_from_affordance_center: float = 0.05  # metres
-    
-    # Grasp pose parameters
     approach_angle_range: Tuple[float, float] = (-30.0, 30.0)  # degrees from vertical
     num_approach_angles: int = 12
+    
+    # Affordance-guided ranking — the paper's core formula:
+    #   ranking = grasp_score / distance_to_affordance_centre
+    # This replaces the weighted-sum approach with the actual AffordGrasp formula.
+    min_distance_epsilon: float = 1e-6  # avoids division by zero
+    max_distance_from_affordance_center: float = 0.10  # metres, hard cutoff
     
     # Post-processing
     collision_check: bool = True

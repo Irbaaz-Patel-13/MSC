@@ -20,11 +20,11 @@ import numpy as np
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import asdict
 
-from config import PipelineConfig
-from sim_env import SimulationEnvironment, CapturedImage
-from affordance_reasoning import AffordanceReasoner, FullReasoningResult
-from visual_grounding import VisualAffordanceGrounder, GroundingResult
-from grasp_generation import AffordanceGraspGenerator, GraspPose
+from modules.config import PipelineConfig
+from modules.sim_env import SimulationEnvironment, CapturedImage
+from modules.affordance_reasoning import AffordanceReasoner, FullReasoningResult
+from modules.visual_grounding import VisualAffordanceGrounder, GroundingResult
+from modules.grasp_generation import AffordanceGraspGenerator, GraspPose
 
 
 class AffordGraspPipeline:
@@ -225,8 +225,17 @@ class AffordGraspPipeline:
         print(f"  Affordance point cloud: {len(affordance_points)} points")
         print(f"  Full point cloud: {len(full_cloud)} points")
         
-        # Use 3D affordance center, or estimate from point cloud
-        aff_center_3d = grounding_result.affordance_center_3d
+        # Compute 3D affordance centre as the mean of all masked 3D points
+        # (more robust than single-pixel back-projection)
+        aff_center_3d = self.grounder.compute_affordance_center_3d_from_mask(
+            grounding_result.affordance_mask,
+            image_data.depth,
+            image_data.camera_intrinsics,
+            image_data.camera_extrinsics
+        )
+        # Fallback: use single-pixel centre or point cloud mean
+        if aff_center_3d is None:
+            aff_center_3d = grounding_result.affordance_center_3d
         if aff_center_3d is None and len(affordance_points) > 0:
             aff_center_3d = affordance_points.mean(axis=0)
         
@@ -235,12 +244,18 @@ class AffordGraspPipeline:
             results["grasps"] = []
             return results
         
-        # Generate grasps
+        print(f"  3D affordance centre: {aff_center_3d}")
+        
+        # Generate grasps — passes depth/intrinsics for Contact-GraspNet,
+        # falls back to antipodal sampling if CGN unavailable
         grasps = self.grasp_gen.generate(
             point_cloud=full_cloud,
             affordance_center_3d=aff_center_3d,
             affordance_points=affordance_points,
-            table_height=self.config.simulation.table_position[2]
+            table_height=self.config.simulation.table_position[2],
+            depth_image=image_data.depth,
+            camera_intrinsics=image_data.camera_intrinsics,
+            segmentation_mask=grounding_result.affordance_mask,
         )
         
         results["grasps"] = [

@@ -1,37 +1,39 @@
 # AffordGrasp - MSc Reproduction Project
-# IMPORTANT: Requires Python 3.10–3.12. Python 3.13 is NOT supported (open3d has no 3.13 wheel).
-# Recommended: Python 3.11 (python3.11 -m venv .venv)
+# ========================================
 
 # Core Simulation
-# NOTE: pybullet builds from source on Windows — requires MSVC Build Tools if no pre-built wheel is found.
-# Install from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 pybullet>=3.2.5
-numpy==1.26.4
+numpy>=1.24.0
 scipy>=1.10.0
 
 # Vision & Image Processing
 opencv-python>=4.8.0
 Pillow>=10.0.0
 matplotlib>=3.7.0
-open3d>=0.19.0  # 0.19.0 added Python 3.12 + NumPy 2 support; minimum for 3.11/3.12
+open3d>=0.17.0
 
-# VLM Affordance Reasoning
-openai>=1.12.0,<2.0.0
+# VLM Affordance Reasoning (GPT-4o with Structured Outputs)
+openai>=1.12.0
+pydantic>=2.0.0  # For Structured Outputs schema validation
 
-# Visual Grounding (LangSAM)
-# Note: Install separately - requires torch first
-# pip install lang-sam
-torch==2.4.1
-torchvision==0.19.1
-segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+# Visual Grounding — LangSAM v0.2.x (GroundingDINO + SAM 2.1)
+# Install PyTorch first with your CUDA version, then LangSAM:
+#   pip install torch==2.4.1 torchvision==0.19.1 --extra-index-url https://download.pytorch.org/whl/cu124
+#   pip install -U git+https://github.com/luca-medeiros/lang-segment-anything.git
+torch>=2.1.0
+torchvision>=0.16.0
 
-# Grasp Generation
-# AnyGrasp requires license from graspnet - see README
-# The code uses antipodal sampling (no graspnetAPI import needed)
-# If you later integrate graspnetAPI, install separately:
-#   pip install "graspnetAPI==1.2.9" "transforms3d==0.3.1"
+# Grasp Generation — Contact-GraspNet (PyTorch port, recommended)
+# Clone and install:
+#   git clone https://github.com/elchun/contact_graspnet_pytorch.git
+#   cd contact_graspnet_pytorch && pip install -e .
+# Fallback: antipodal sampling requires no extra install.
+
+# YCB Object Models for realistic clutter
+pybullet-object-models>=1.0.0
 
 # Utilities
 trimesh>=3.23.0
+transforms3d>=0.4.1
 pyyaml>=6.0
 tqdm>=4.65.0
