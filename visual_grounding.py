@@ -21,7 +21,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from .config import VisualGroundingConfig
+from config import VisualGroundingConfig
 
 
 @dataclass
@@ -66,17 +66,32 @@ class VisualAffordanceGrounder:
         self.config = config
         self.lang_sam = None
         self.use_langsam = False
-        
+
         # Try to load LangSAM
         try:
             from lang_sam import LangSAM
-            self.lang_sam = LangSAM()
+            self.lang_sam = LangSAM(sam_type=self.config.sam_variant)
             self.use_langsam = True
             print("[VisualGrounder] LangSAM loaded successfully.")
-        except ImportError:
-            print("[VisualGrounder] LangSAM not available.")
-            print("  Install with: pip install lang-sam")
-            print("  Using simulation segmentation fallback.")
+        except ImportError as e:
+            if config.force_sim_fallback:
+                print("[VisualGrounder] WARNING: LangSAM not available — running with "
+                      "simulation segmentation fallback (force_sim_fallback=True).")
+                print("  Affordance masks will be heuristic, NOT visually grounded.")
+                print(f"  Import error: {e}")
+            else:
+                raise ImportError(
+                    "\n\n"
+                    "LangSAM is required for real AffordGrasp perception but could not be imported.\n"
+                    f"  Error: {e}\n\n"
+                    "Install steps:\n"
+                    "  pip install torch==2.4.1 torchvision==0.19.1 "
+                    "--extra-index-url https://download.pytorch.org/whl/cu124\n"
+                    "  pip install -U git+https://github.com/luca-medeiros/lang-segment-anything.git\n\n"
+                    "To run with simulation segmentation fallback instead (lower quality):\n"
+                    "  python pipeline.py --use-sim-segmentation ...\n"
+                    "  (sets config.visual_grounding.force_sim_fallback = True)"
+                ) from e
     
     def ground(
         self,
@@ -271,7 +286,9 @@ class VisualAffordanceGrounder:
         try:
             # Fall back to v0.1.x single-image API
             masks, boxes, phrases, logits = self.lang_sam.predict(
-                pil_image, text_prompt
+                pil_image, text_prompt,
+                box_threshold=self.config.box_threshold,
+                text_threshold=self.config.text_threshold
             )
             if isinstance(masks, torch.Tensor) and masks.numel() > 0:
                 return {

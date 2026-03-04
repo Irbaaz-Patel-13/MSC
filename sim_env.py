@@ -15,13 +15,14 @@ Reference: AffordGrasp uses PyBullet with UR5 arm + RS-485 gripper + RealSense L
 
 import os
 import time
+import traceback
 import numpy as np
 import pybullet as p
 import pybullet_data
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from .config import SimulationConfig
+from config import SimulationConfig
 
 
 @dataclass
@@ -125,29 +126,30 @@ class SimulationEnvironment:
             basePosition=[table_pos[0], table_pos[1], table_pos[2] - half_extents[2]]
         )
         
-        # Table legs
+        # Table legs - only create if table surface is elevated above the ground
         leg_radius = 0.025
         leg_height = table_pos[2] - self.config.table_size[2]
-        leg_positions = [
-            (table_pos[0] - half_extents[0] + 0.05, table_pos[1] - half_extents[1] + 0.05),
-            (table_pos[0] + half_extents[0] - 0.05, table_pos[1] - half_extents[1] + 0.05),
-            (table_pos[0] - half_extents[0] + 0.05, table_pos[1] + half_extents[1] - 0.05),
-            (table_pos[0] + half_extents[0] - 0.05, table_pos[1] + half_extents[1] - 0.05),
-        ]
-        for lx, ly in leg_positions:
-            leg_col = p.createCollisionShape(
-                p.GEOM_CYLINDER, radius=leg_radius, height=leg_height
-            )
-            leg_vis = p.createVisualShape(
-                p.GEOM_CYLINDER, radius=leg_radius, length=leg_height,
-                rgbaColor=[0.4, 0.3, 0.2, 1.0]
-            )
-            p.createMultiBody(
-                baseMass=0,
-                baseCollisionShapeIndex=leg_col,
-                baseVisualShapeIndex=leg_vis,
-                basePosition=[lx, ly, leg_height / 2]
-            )
+        if leg_height > 0:
+            leg_positions = [
+                (table_pos[0] - half_extents[0] + 0.05, table_pos[1] - half_extents[1] + 0.05),
+                (table_pos[0] + half_extents[0] - 0.05, table_pos[1] - half_extents[1] + 0.05),
+                (table_pos[0] - half_extents[0] + 0.05, table_pos[1] + half_extents[1] - 0.05),
+                (table_pos[0] + half_extents[0] - 0.05, table_pos[1] + half_extents[1] - 0.05),
+            ]
+            for lx, ly in leg_positions:
+                leg_col = p.createCollisionShape(
+                    p.GEOM_CYLINDER, radius=leg_radius, height=leg_height
+                )
+                leg_vis = p.createVisualShape(
+                    p.GEOM_CYLINDER, radius=leg_radius, length=leg_height,
+                    rgbaColor=[0.4, 0.3, 0.2, 1.0]
+                )
+                p.createMultiBody(
+                    baseMass=0,
+                    baseCollisionShapeIndex=leg_col,
+                    baseVisualShapeIndex=leg_vis,
+                    basePosition=[lx, ly, leg_height / 2]
+                )
         
         return table_id
     
@@ -167,7 +169,7 @@ class SimulationEnvironment:
         home_joints = list(self.config.home_joint_positions)
         num_joints = p.getNumJoints(self.robot_id)
         
-        for i, angle in enumerate(home_joints[:min(6, num_joints)]):
+        for i, angle in enumerate(home_joints[:min(7, num_joints)]):
             p.resetJointState(self.robot_id, i, angle)
     
     # =========================================================================
@@ -177,59 +179,112 @@ class SimulationEnvironment:
     def _try_load_ycb(self, category: str, position: np.ndarray,
                       color: Tuple[float, ...]) -> Optional[SceneObject]:
         """
-        Attempt to load a YCB mesh object. Returns None if unavailable.
-        Uses pybullet_object_models if installed, else returns None.
+        Load a YCB mesh object from the local elpis-lab/YCB_Dataset clone.
+
+        URDF layout expected:
+            <ycb_data_path>/<ycb_id>.urdf          -- robot description
+            <ycb_data_path>/<ycb_id>/textured.obj  -- visual mesh
+            <ycb_data_path>/<ycb_id>/texture_map.png
+            <ycb_data_path>/<ycb_id>/textured_coacd_*.stl  -- collision meshes
+
+        PyBullet resolves mesh filenames in the URDF relative to the URDF
+        file's parent directory, so loading the absolute URDF path is enough.
+
+        For headless (DIRECT) mode textures render via ER_TINY_RENDERER.
+        In GUI mode use ER_BULLET_HARDWARE_OPENGL for full texture support.
+
+        Returns a SceneObject on success, or None if the URDF is missing or
+        loading fails (caller falls back to spawn_primitive_object).
         """
         if not self.config.use_ycb_objects:
             return None
-        
-        # Map category names to YCB model names
-        category_to_ycb = {
-            "mug": "YcbMug", "cup": "YcbMug",
-            "bowl": "YcbBowl",
-            "bottle": "YcbMustardBottle",
-            "hammer": "YcbHammer",
-            "knife": "YcbKnife",
-            "fork": "YcbFork",
-            "spoon": "YcbSpoon",
-            "scissors": "YcbScissors",
-            "pan": "YcbSkillet",
-        }
-        
-        ycb_name = category_to_ycb.get(category)
-        if ycb_name is None:
+
+        ycb_data_path = self.config.ycb_data_path
+        if not ycb_data_path:
             return None
-        
+
+        ycb_id = self.config.category_to_ycb_id.get(category)
+        if ycb_id is None:
+            return None
+
+        urdf_path = os.path.join(ycb_data_path, f"{ycb_id}.urdf")
+        if not os.path.isfile(urdf_path):
+            print(f"[SimEnv] YCB URDF not found: {urdf_path}")
+            return None
+
+        spawn_pos = [position[0], position[1], position[2] + 0.05]
+        orientation = p.getQuaternionFromEuler(
+            [0, 0, np.random.uniform(0, 2 * np.pi)]
+        )
+
+        body_id = None
+
+        # --- Attempt 1: load the full URDF (visual + collision + inertia) ---
         try:
-            from pybullet_object_models import ycb_objects
-            urdf_path = os.path.join(
-                ycb_objects.getDataPath(), ycb_name, "model.urdf"
+            body_id = p.loadURDF(
+                urdf_path, spawn_pos, list(orientation),
+                useFixedBase=False, globalScaling=1.0,
+                flags=p.URDF_USE_MATERIAL_COLORS_FROM_MTL
             )
-            if not os.path.exists(urdf_path):
-                return None
-            
-            spawn_pos = [position[0], position[1], position[2] + 0.05]
-            orientation = p.getQuaternionFromEuler(
-                [0, 0, np.random.uniform(0, 2 * np.pi)]
-            )
-            
-            body_id = p.loadURDF(urdf_path, spawn_pos, list(orientation))
-            
-            obj = SceneObject(
-                body_id=body_id,
-                name=f"ycb_{ycb_name}",
-                category=category,
-                position=np.array(spawn_pos),
-                orientation=np.array(orientation),
-                color=color
-            )
-            self.objects.append(obj)
-            return obj
-            
-        except ImportError:
-            return None
         except Exception:
+            print(f"[SimEnv] URDF load failed for {ycb_id}:\n"
+                  + traceback.format_exc().rstrip())
+
+        # --- Attempt 2: load OBJ as visual mesh + box collision ---
+        if body_id is None:
+            obj_path = os.path.join(ycb_data_path, ycb_id, "textured.obj")
+            if os.path.isfile(obj_path):
+                try:
+                    vis_id = p.createVisualShape(
+                        p.GEOM_MESH, fileName=obj_path,
+                        meshScale=[1.0, 1.0, 1.0]
+                    )
+                    col_id = p.createCollisionShape(
+                        p.GEOM_BOX, halfExtents=[0.04, 0.04, 0.04]
+                    )
+                    body_id = p.createMultiBody(
+                        baseMass=0.1,
+                        baseCollisionShapeIndex=col_id,
+                        baseVisualShapeIndex=vis_id,
+                        basePosition=spawn_pos,
+                        baseOrientation=list(orientation)
+                    )
+                    print(f"[SimEnv] OBJ mesh fallback succeeded for {ycb_id}")
+                except Exception:
+                    print(f"[SimEnv] OBJ mesh fallback failed for {ycb_id}:\n"
+                          + traceback.format_exc().rstrip())
+
+        if body_id is None:
             return None
+
+        # --- Verify texture; apply manually if PyBullet didn't bind it ---
+        # getVisualShapeData()[link_idx][8] == textureUniqueId; -1 = not loaded.
+        try:
+            vis_data = p.getVisualShapeData(body_id)
+            if vis_data and vis_data[0][8] == -1:
+                tex_path = os.path.join(ycb_data_path, ycb_id, "texture_map.png")
+                if os.path.isfile(tex_path):
+                    try:
+                        tex_id = p.loadTexture(tex_path)
+                        p.changeVisualShape(body_id, -1, textureUniqueId=tex_id)
+                    except Exception as tex_e:
+                        print(f"[SimEnv] Texture fallback failed for {ycb_id}: {tex_e}")
+                else:
+                    print(f"[SimEnv] Warning: no texture_map.png for {ycb_id}")
+        except Exception:
+            pass  # non-fatal: object still usable without texture
+
+        obj = SceneObject(
+            body_id=body_id,
+            name=f"ycb_{ycb_id}",
+            category=category,
+            position=np.array(spawn_pos),
+            orientation=np.array(orientation),
+            color=color
+        )
+        self.objects.append(obj)
+        print(f"[SimEnv] Loaded YCB mesh: {ycb_id}")
+        return obj
     
     def spawn_primitive_object(
         self,
@@ -377,6 +432,9 @@ class SimulationEnvironment:
         
         # Spawn target object at a random position (try YCB, fall back to primitive)
         target_idx = np.random.randint(len(positions))
+        ycb_count = 0
+        prim_count = 0
+
         target = self._try_load_ycb(target_category, positions[target_idx], colours[0])
         if target is None:
             target = self.spawn_primitive_object(
@@ -385,7 +443,10 @@ class SimulationEnvironment:
                 position=positions[target_idx],
                 color=colours[0]
             )
-        
+            prim_count += 1
+        else:
+            ycb_count += 1
+
         # Spawn distractors
         distractors = []
         distractor_cats = np.random.choice(
@@ -393,14 +454,14 @@ class SimulationEnvironment:
             size=min(num_distractors, len(distractor_categories)),
             replace=False
         )
-        
+
         pos_idx = 0
         for i, cat in enumerate(distractor_cats):
             if pos_idx == target_idx:
                 pos_idx += 1
             if pos_idx >= len(positions):
                 break
-            
+
             obj = self._try_load_ycb(cat, positions[pos_idx], colours[(i + 1) % len(colours)])
             if obj is None:
                 obj = self.spawn_primitive_object(
@@ -409,15 +470,21 @@ class SimulationEnvironment:
                     position=positions[pos_idx],
                     color=colours[(i + 1) % len(colours)]
                 )
+                prim_count += 1
+            else:
+                ycb_count += 1
             distractors.append(obj)
             pos_idx += 1
-        
+
         # Let objects settle
         for _ in range(100):
             p.stepSimulation()
-        
+
+        total = ycb_count + prim_count
         print(f"[SimEnv] Spawned clutter scene: target={target_category}, "
               f"{len(distractors)} distractors")
+        print(f"[SimEnv] Loaded {ycb_count}/{total} as textured YCB meshes, "
+              f"{prim_count} fell back to primitives")
         return target, distractors
     
     def _random_table_position(self) -> np.ndarray:
@@ -601,7 +668,7 @@ class SimulationEnvironment:
         )
         
         # Apply joint positions with position control
-        for i, pos in enumerate(joint_positions[:6]):
+        for i, pos in enumerate(joint_positions[:7]):
             p.setJointMotorControl2(
                 self.robot_id, i, p.POSITION_CONTROL,
                 targetPosition=pos,
@@ -677,42 +744,48 @@ class SimulationEnvironment:
             lifted = obj_pos[2] > table_z + 0.05
             
             if lifted:
-                # Stability check: simulate 50 more steps, verify drift < 2cm
+                # Stability check: simulate 100 more steps, verify drift < 5cm
                 pre_pos = np.array(obj_pos)
-                for _ in range(50):
+                for _ in range(100):
                     p.stepSimulation()
                 post_pos, _ = p.getBasePositionAndOrientation(grasped_id)
                 drift = np.linalg.norm(np.array(post_pos) - pre_pos)
-                stable = drift < 0.02
+                stable = drift < 0.05
                 
                 # Also check persistent contact with gripper
                 contacts = p.getContactPoints(self.robot_id, grasped_id)
                 gripping = len(contacts) > 0
                 
                 if stable and gripping:
-                    print(f"[SimEnv] ✓ Grasp successful! "
+                    print(f"[SimEnv] Grasp successful! "
                           f"(lifted {obj_pos[2] - table_z:.3f}m, drift {drift:.4f}m)")
                     return True
                 else:
-                    print(f"[SimEnv] ✗ Grasp unstable "
+                    print(f"[SimEnv] Grasp unstable "
                           f"(drift={drift:.4f}m, contact={gripping})")
                     return False
-        
-        print("[SimEnv] ✗ Grasp failed.")
+
+        print("[SimEnv] Grasp failed.")
         return False
     
-    def _find_nearest_object(self, position: np.ndarray, max_dist: float = 0.05) -> Optional[int]:
-        """Find the nearest object to a given position."""
+    def _find_nearest_object(self, position: np.ndarray, max_dist: float = 0.10) -> Optional[int]:
+        """Find the nearest object to a given position (search radius = 10 cm)."""
         nearest_id = None
         nearest_dist = max_dist
-        
+        nearest_name = None
+
         for obj in self.objects:
             obj_pos, _ = p.getBasePositionAndOrientation(obj.body_id)
             dist = np.linalg.norm(np.array(obj_pos) - position)
             if dist < nearest_dist:
                 nearest_dist = dist
                 nearest_id = obj.body_id
-        
+                nearest_name = obj.name
+
+        if nearest_id is not None:
+            print(f"[SimEnv] Nearest object: {nearest_name} at {nearest_dist:.3f}m")
+        else:
+            print(f"[SimEnv] No object within {max_dist:.2f}m of grasp point")
         return nearest_id
     
     # =========================================================================

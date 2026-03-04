@@ -21,13 +21,13 @@ class SimulationConfig:
     time_step: float = 1.0 / 240.0
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     
-    # UR5 Robot — use pybullet_ur5_robotiq URDF for UR5 + Robotiq-85
-    robot_urdf: str = "ur5/ur5.urdf"  # PyBullet data path (fallback)
+    # Franka Panda — bundled with pybullet_data (ur5/ur5.urdf is NOT in pybullet_data)
+    robot_urdf: str = "franka_panda/panda.urdf"
     robot_base_position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     robot_base_orientation: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
-    end_effector_index: int = 7  # UR5 EE link (verify against your URDF)
-    # Home joint configuration for UR5
-    home_joint_positions: Tuple = (-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0)
+    end_effector_index: int = 11  # panda_grasptarget link (between fingers)
+    # Home joint configuration for Franka Panda (7 joints)
+    home_joint_positions: Tuple = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
     
     # Gripper
     gripper_type: str = "robotiq_85"  # or "simple_gripper"
@@ -53,16 +53,42 @@ class SimulationConfig:
     camera_near: float = 0.01
     camera_far: float = 5.0  # extended for wider depth range
     
-    # Object loading: use YCB meshes when available, primitives as fallback
+    # Object loading: use YCB meshes from the cloned elpis-lab/YCB_Dataset repo.
+    # ycb_data_path is the path to the YCB_Dataset/ycb/ directory that contains
+    # the per-object sub-folders (mug/, bowl/, ...) and their matching .urdf files.
+    # Set to "" to let PipelineConfig.__post_init__ auto-resolve it relative to
+    # this file's location (YCB_Dataset/ycb/ sibling of config.py).
     use_ycb_objects: bool = True
-    ycb_data_path: str = ""  # auto-detected from pybullet_object_models if installed
-    
-    # Clutter settings
+    ycb_data_path: str = ""  # resolved in PipelineConfig.__post_init__
+
+    # Mapping from pipeline category names to elpis-lab/YCB_Dataset folder names.
+    # Each value must match a <name>.urdf file in ycb_data_path and a <name>/
+    # sub-folder containing textured.obj + texture_map.png + textured_coacd_*.stl.
+    category_to_ycb_id: dict = field(default_factory=lambda: {
+        "mug":         "mug",
+        "cup":         "a_cups",
+        "bowl":        "bowl",
+        "spoon":       "spoon",
+        "hammer":      "hammer",
+        "knife":       "knife",
+        "fork":        "fork",
+        "scissors":    "scissors",
+        "screwdriver": "phillips_screwdriver",
+        "spatula":     "spatula",
+        "bottle":      "mustard_bottle",
+        "wine_glass":  "pitcher_base",
+        "drill":       "power_drill",
+        "kettle":      "tomato_soup_can",
+        "racket":      "foam_brick",
+        "pan":         "skillet_lid",
+    })
+
+    # Clutter settings — only categories that have a YCB mapping are included.
     num_distractor_objects: int = 5
     object_categories: List[str] = field(default_factory=lambda: [
-        "cup", "spoon", "hammer", "bowl", "screwdriver",
-        "scissors", "wine_glass", "knife", "fork", "bottle",
-        "mug", "pan", "spatula", "kettle", "racket"
+        "mug", "cup", "bowl", "spoon", "hammer",
+        "knife", "fork", "scissors", "screwdriver", "spatula",
+        "bottle", "wine_glass", "drill", "kettle", "pan",
     ])
 
 
@@ -170,9 +196,14 @@ class VisualGroundingConfig:
     # Image processing — paper uses 224x224 for affordance segmentation,
     # but LangSAM works best at native resolution (no resize needed)
     resize_for_segmentation: bool = False
-    
+
     # Device
     device: str = "cuda"  # or "cpu"
+
+    # Set True to allow simulation segmentation fallback when LangSAM is
+    # unavailable. Default False: missing LangSAM raises ImportError so
+    # the user knows real perception is not active.
+    force_sim_fallback: bool = False
 
 
 @dataclass
@@ -181,8 +212,12 @@ class GraspConfig:
     # Method: "contact_graspnet" (recommended open-source) or "antipodal" (fallback)
     method: str = "contact_graspnet"
     
-    # Contact-GraspNet configuration (PyTorch port by elchun)
-    cgn_checkpoint_dir: str = "checkpoints/contact_graspnet"
+    # Contact-GraspNet configuration (PyTorch port by elchun).
+    # Points to the directory that contains config.yaml and a checkpoints/
+    # sub-folder with model.pt. The repo clone already ships config.yaml here;
+    # download model.pt from the elchun/contact_graspnet_pytorch README and
+    # place it at: <cgn_checkpoint_dir>/checkpoints/model.pt
+    cgn_checkpoint_dir: str = "contact_graspnet_pytorch/checkpoints/contact_graspnet"
     cgn_forward_passes: int = 5   # number of stochastic forward passes
     cgn_z_range: Tuple[float, float] = (0.2, 1.8)  # depth range filter (metres)
     cgn_local_regions: bool = True  # per-segment grasp generation
@@ -228,3 +263,7 @@ class PipelineConfig:
         os.makedirs(self.output_dir, exist_ok=True)
         if not self.vlm.api_key:
             self.vlm.api_key = os.environ.get("OPENAI_API_KEY", "")
+        # Auto-resolve ycb_data_path relative to this file's location
+        if not self.simulation.ycb_data_path:
+            here = os.path.dirname(os.path.abspath(__file__))
+            self.simulation.ycb_data_path = os.path.join(here, "YCB_Dataset", "ycb")

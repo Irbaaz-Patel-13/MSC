@@ -1,0 +1,6 @@
+{
+  "task_goal": "To drive nails into a surface",
+  "target_object": "hammer",
+  "optimal_part": "handle",
+  "approach": "side"
+}

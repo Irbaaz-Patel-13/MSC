@@ -3,34 +3,34 @@
 
 # Core Simulation
 pybullet>=3.2.5
-numpy>=1.24.0
+numpy==1.26.4         # Pin: NumPy 2.x breaks open3d + older torch builds
 scipy>=1.10.0
 
 # Vision & Image Processing
 opencv-python>=4.8.0
 Pillow>=10.0.0
 matplotlib>=3.7.0
-open3d>=0.17.0
+open3d>=0.19.0        # 0.19+ required for Python 3.11/3.12 + NumPy 1.26
 
 # VLM Affordance Reasoning (GPT-4o with Structured Outputs)
-openai>=1.12.0
-pydantic>=2.0.0  # For Structured Outputs schema validation
+openai>=1.12.0,<2.0.0
+pydantic>=2.0.0       # For Structured Outputs schema validation
 
 # Visual Grounding — LangSAM v0.2.x (GroundingDINO + SAM 2.1)
 # Install PyTorch first with your CUDA version, then LangSAM:
 #   pip install torch==2.4.1 torchvision==0.19.1 --extra-index-url https://download.pytorch.org/whl/cu124
 #   pip install -U git+https://github.com/luca-medeiros/lang-segment-anything.git
-torch>=2.1.0
-torchvision>=0.16.0
+torch==2.4.1          # Pin for reproducibility with torchvision + numpy 1.26.4
+torchvision==0.19.1
 
 # Grasp Generation — Contact-GraspNet (PyTorch port, recommended)
 # Clone and install:
 #   git clone https://github.com/elchun/contact_graspnet_pytorch.git
 #   cd contact_graspnet_pytorch && pip install -e .
-# Fallback: antipodal sampling requires no extra install.
+# Fallback: antipodal sampling (default) requires no extra install.
 
-# YCB Object Models for realistic clutter
-pybullet-object-models>=1.0.0
+# NOTE: pybullet-object-models does NOT exist on PyPI.
+# YCB meshes are loaded as primitives when unavailable (sim fallback).
 
 # Utilities
 trimesh>=3.23.0

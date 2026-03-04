@@ -1,0 +1,6 @@
+{
+  "task_goal": "Drive nails into a surface",
+  "target_object": "red cylindrical object",
+  "optimal_part": "curved surface",
+  "approach": "side"
+}

@@ -22,7 +22,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 from scipy.spatial.transform import Rotation
 
-from .config import GraspConfig
+from config import GraspConfig
 
 
 @dataclass
@@ -75,39 +75,71 @@ class AffordanceGraspGenerator:
     
     def _try_load_contact_graspnet(self) -> None:
         """Attempt to load Contact-GraspNet PyTorch model."""
-        try:
-            from contact_graspnet_pytorch.contact_graspnet import (
-                ContactGraspNet, load_config as cgn_load_config
-            )
-            import torch
-            
-            cgn_config = cgn_load_config(self.config.cgn_checkpoint_dir)
-            self.cgn_model = ContactGraspNet(cgn_config)
-            
-            # Load checkpoint
-            import glob
-            ckpt_files = glob.glob(
-                f"{self.config.cgn_checkpoint_dir}/*.pt"
-            ) + glob.glob(
-                f"{self.config.cgn_checkpoint_dir}/*.pth"
-            )
-            if ckpt_files:
-                ckpt = torch.load(ckpt_files[0], map_location="cuda")
-                self.cgn_model.load_state_dict(ckpt)
-                self.cgn_model.cuda().eval()
-                print("[GraspGen] Contact-GraspNet loaded successfully.")
-            else:
-                print(f"[GraspGen] No checkpoint found in {self.config.cgn_checkpoint_dir}")
-                self.cgn_model = None
-                
-        except ImportError:
-            print("[GraspGen] contact_graspnet_pytorch not installed.")
-            print("  Install: pip install -e . from the contact_graspnet_pytorch repo")
-            print("  Falling back to antipodal sampling.")
+        # --- Step 1: check package is on sys.path without importing it ---
+        import importlib.util
+        if importlib.util.find_spec("contact_graspnet_pytorch") is None:
+            print("[GraspGen] contact_graspnet_pytorch not found on sys.path.")
+            print("  Install:")
+            print("    git clone https://github.com/elchun/contact_graspnet_pytorch.git")
+            print("    cd contact_graspnet_pytorch && pip install -e .")
+            print("")
+            print("WARNING: Using antipodal sampling fallback. "
+                  "Grasp quality will be significantly lower than Contact-GraspNet.")
             self.cgn_model = None
+            return
+
+        # --- Step 2: import the actual classes (GraspEstimator, not ContactGraspNet) ---
+        try:
+            from contact_graspnet_pytorch.contact_grasp_estimator import GraspEstimator
+            from contact_graspnet_pytorch import config_utils
+            from contact_graspnet_pytorch.checkpoints import CheckpointIO
+        except ImportError as e:
+            print(f"[GraspGen] contact_graspnet_pytorch sub-module missing: {e}")
+            print("  Try reinstalling: cd contact_graspnet_pytorch && pip install -e .")
+            print("")
+            print("WARNING: Using antipodal sampling fallback. "
+                  "Grasp quality will be significantly lower than Contact-GraspNet.")
+            self.cgn_model = None
+            return
+
+        # --- Step 3: load config + model + checkpoint ---
+        # Expected layout for cgn_checkpoint_dir:
+        #   <ckpt_dir>/config.yaml         ← shipped with the repo clone
+        #   <ckpt_dir>/checkpoints/model.pt ← download from repo README
+        try:
+            import os
+
+            ckpt_dir = self.config.cgn_checkpoint_dir
+            global_config = config_utils.load_config(ckpt_dir)
+            grasp_estimator = GraspEstimator(global_config)
+
+            model_ckpt_dir = os.path.join(ckpt_dir, "checkpoints")
+            model_pt = os.path.join(model_ckpt_dir, "model.pt")
+            if not os.path.isfile(model_pt):
+                print(f"[GraspGen] No checkpoint at {model_pt}")
+                print("  Download the pretrained weights from the elchun/"
+                      "contact_graspnet_pytorch README (Google Drive link)")
+                print("  and place model.pt in: " + model_ckpt_dir)
+                print("")
+                print("WARNING: Using antipodal sampling fallback. "
+                      "Grasp quality will be significantly lower than Contact-GraspNet.")
+                self.cgn_model = None
+                return
+
+            checkpoint_io = CheckpointIO(
+                checkpoint_dir=model_ckpt_dir, model=grasp_estimator.model
+            )
+            checkpoint_io.load("model.pt")
+            grasp_estimator.model.eval()
+
+            self.cgn_model = grasp_estimator
+            print(f"[GraspGen] Contact-GraspNet loaded from {model_pt}")
+
         except Exception as e:
             print(f"[GraspGen] Contact-GraspNet load failed: {e}")
-            print("  Falling back to antipodal sampling.")
+            print("")
+            print("WARNING: Using antipodal sampling fallback. "
+                  "Grasp quality will be significantly lower than Contact-GraspNet.")
             self.cgn_model = None
     
     def generate(
@@ -217,62 +249,83 @@ class AffordanceGraspGenerator:
         segmask: Optional[np.ndarray] = None
     ) -> List[GraspPose]:
         """
-        Generate grasps using Contact-GraspNet.
-        
-        Input: depth map + camera intrinsics + optional segmentation mask.
-        Output: list of GraspPose with quality_score from the network.
-        
-        Contact-GraspNet returns per-segment grasp predictions as:
-          pred_grasps_cam[seg_id] → (N, 4, 4) homogeneous transforms
-          scores[seg_id] → (N,) confidence scores
-          contact_pts[seg_id] → (N, 3) contact points
+        Generate grasps using Contact-GraspNet (elchun/contact_graspnet_pytorch).
+
+        The GraspEstimator API:
+          1. extract_point_clouds(depth, K, segmap, z_range)
+               → pc_full (N,3), pc_segments {seg_id: (M,3)}, pc_colors
+          2. predict_scene_grasps(pc_full, pc_segments, local_regions, ...)
+               → pred_grasps_cam {seg_id: (N,4,4)}, scores {seg_id: (N,)},
+                  contact_pts, gripper_openings {seg_id: (N,)}
+
+        segmask is passed as an integer segmap so the affordance region
+        (pixel value = 1) becomes its own pc_segment for local-region inference.
         """
         try:
-            from contact_graspnet_pytorch import inference as cgn_inference
-            import torch
-            
-            # Prepare input dict
-            pc_full, pc_segments, _ = cgn_inference.extract_point_clouds(
-                depth, intrinsics,
-                segmap=segmask if segmask is not None else np.ones_like(depth, dtype=np.int32),
-                z_range=list(self.config.cgn_z_range)
+            z_range = list(self.config.cgn_z_range)
+
+            # Integer segmap: 0 = background, 1 = affordance region
+            segmap = segmask.astype(np.int32) if segmask is not None else None
+
+            # Step 1: depth → point clouds
+            pc_full, pc_segments, _ = self.cgn_model.extract_point_clouds(
+                depth, intrinsics, segmap=segmap, z_range=z_range
             )
-            
-            pred_grasps, scores, contact_pts, _ = cgn_inference.predict_grasps(
-                self.cgn_model, pc_full, pc_segments,
-                forward_passes=self.config.cgn_forward_passes,
-                filter_grasps=self.config.cgn_filter_grasps
-            )
-            
-            # Convert to GraspPose objects
+
+            # Step 2: grasp prediction
+            pred_grasps_cam, scores, _, gripper_openings = \
+                self.cgn_model.predict_scene_grasps(
+                    pc_full,
+                    pc_segments=pc_segments,
+                    local_regions=self.config.cgn_local_regions,
+                    filter_grasps=self.config.cgn_filter_grasps,
+                    forward_passes=self.config.cgn_forward_passes
+                )
+
+            # Step 3: convert to GraspPose objects
             candidates = []
-            for seg_id in pred_grasps:
-                poses_4x4 = pred_grasps[seg_id]     # (N, 4, 4)
-                seg_scores = scores[seg_id]           # (N,)
-                
+            for seg_id, poses_raw in pred_grasps_cam.items():
+                if poses_raw is None or len(poses_raw) == 0:
+                    continue
+
+                poses_4x4 = np.array(poses_raw)           # (N, 4, 4)
+                seg_scores = np.atleast_1d(
+                    np.array(scores.get(seg_id, []))
+                )
+                seg_widths = np.atleast_1d(
+                    np.array(gripper_openings.get(seg_id, []))
+                )
+
                 for i in range(len(poses_4x4)):
                     T = poses_4x4[i]
                     rot = T[:3, :3]
-                    pos = T[:3, 3]
-                    quat = Rotation.from_matrix(rot).as_quat()
-                    approach = rot[:, 2]  # z-axis is approach
-                    
+                    pos = T[:3, 3].copy()
+                    try:
+                        quat = Rotation.from_matrix(rot).as_quat()
+                    except Exception:
+                        continue  # degenerate rotation matrix
+
+                    width = float(seg_widths[i]) if i < len(seg_widths) else 0.08
+                    score = float(seg_scores[i]) if i < len(seg_scores) else 0.0
+
                     candidates.append(GraspPose(
                         position=pos,
                         orientation=quat,
                         rotation_matrix=rot,
-                        width=0.08,  # Robotiq-85 default
-                        quality_score=float(seg_scores[i]),
+                        width=width,
+                        quality_score=score,
                         affordance_score=0.0,
                         combined_score=0.0,
-                        approach_direction=approach
+                        approach_direction=rot[:, 2]
                     ))
-            
+
             print(f"[GraspGen] Contact-GraspNet produced {len(candidates)} grasps")
             return candidates
-            
+
         except Exception as e:
+            import traceback
             print(f"[GraspGen] Contact-GraspNet inference failed: {e}")
+            traceback.print_exc()
             print("  Falling back to antipodal sampling on available point cloud.")
             return []
     

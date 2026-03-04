@@ -20,11 +20,11 @@ import numpy as np
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import asdict
 
-from modules.config import PipelineConfig
-from modules.sim_env import SimulationEnvironment, CapturedImage
-from modules.affordance_reasoning import AffordanceReasoner, FullReasoningResult
-from modules.visual_grounding import VisualAffordanceGrounder, GroundingResult
-from modules.grasp_generation import AffordanceGraspGenerator, GraspPose
+from config import PipelineConfig
+from sim_env import SimulationEnvironment, CapturedImage
+from affordance_reasoning import AffordanceReasoner, FullReasoningResult
+from visual_grounding import VisualAffordanceGrounder, GroundingResult
+from grasp_generation import AffordanceGraspGenerator, GraspPose
 
 
 class AffordGraspPipeline:
@@ -79,7 +79,7 @@ class AffordGraspPipeline:
         print("[4/4] Initialising grasp generator...")
         self.grasp_gen = AffordanceGraspGenerator(self.config.grasp)
         
-        print("\n✓ Pipeline ready.\n")
+        print("\n[OK] Pipeline ready.\n")
     
     def run(
         self,
@@ -151,7 +151,8 @@ class AffordGraspPipeline:
         reasoning_result = self.reasoner.reason(
             instruction=instruction,
             scene_image=image_data.rgb,
-            verbose=True
+            verbose=True,
+            target_hint=target_category
         )
         
         results["reasoning"] = {
@@ -313,9 +314,9 @@ class AffordGraspPipeline:
         print(f"  PIPELINE SUMMARY")
         print(f"{'='*60}")
         print(f"  Instruction: \"{instruction}\"")
-        print(f"  Target: {target_object_name} → Grasp: {target_part_name}")
+        print(f"  Target: {target_object_name} -> Grasp: {target_part_name}")
         print(f"  Grasps generated: {len(grasps)}")
-        print(f"  Grasp success: {'✓' if results['success'] else '✗'}")
+        print(f"  Grasp success: {'OK' if results['success'] else 'FAIL'}")
         print(f"{'='*60}\n")
         
         return results
@@ -450,10 +451,20 @@ def main():
         "--output-dir", type=str, default="results",
         help="Output directory for results"
     )
+    parser.add_argument(
+        "--use-sim-segmentation", action="store_true",
+        help=(
+            "Fall back to PyBullet segmentation masks instead of LangSAM. "
+            "Affordance masks will be heuristic, NOT visually grounded. "
+            "Use only when LangSAM cannot be installed."
+        )
+    )
     args = parser.parse_args()
-    
+
     # Create configuration
     config = PipelineConfig(output_dir=args.output_dir)
+    if args.use_sim_segmentation:
+        config.visual_grounding.force_sim_fallback = True
     
     # Create and setup pipeline
     pipeline = AffordGraspPipeline(config)

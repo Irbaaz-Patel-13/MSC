@@ -59,7 +59,7 @@ except ImportError:
     PYDANTIC_AVAILABLE = False
     print("[Warning] pydantic not installed. Structured Outputs disabled; using JSON parsing.")
 
-from .config import VLMConfig
+from config import VLMConfig
 
 
 @dataclass
@@ -129,15 +129,18 @@ class AffordanceReasoner:
         if OpenAI is not None and config.api_key:
             self.client = OpenAI(api_key=config.api_key)
         else:
-            print("[AffordanceReasoner] Running in MOCK mode (no API key).")
-            print("  Set OPENAI_API_KEY environment variable for real VLM reasoning.")
+            print("WARNING: No OPENAI_API_KEY found. Running in mock mode --"
+                  " VLM will hallucinate objects.")
+            print("  Set your API key with:  export OPENAI_API_KEY=sk-...")
+            print("  (or set OPENAI_API_KEY in your environment before running)")
             self.mock_mode = True
     
     def reason(
         self,
         instruction: str,
         scene_image: np.ndarray,
-        verbose: bool = True
+        verbose: bool = True,
+        target_hint: Optional[str] = None
     ) -> FullReasoningResult:
         """
         Execute the full three-step affordance reasoning pipeline.
@@ -169,7 +172,7 @@ class AffordanceReasoner:
         if verbose:
             print("\n--- Step 2: Object Identification ---")
         obj_result = self._step2_object_identification(
-            scene_image, task_result
+            scene_image, task_result, target_hint=target_hint
         )
         if verbose:
             print(f"  Target Object: {obj_result.target_object}")
@@ -232,17 +235,18 @@ class AffordanceReasoner:
     def _step2_object_identification(
         self,
         scene_image: np.ndarray,
-        task_result: TaskAnalysisResult
+        task_result: TaskAnalysisResult,
+        target_hint: Optional[str] = None
     ) -> ObjectIdentificationResult:
         """
         Identify the most suitable object in the scene for the given task.
         Uses the scene image + task analysis to ground the object visually.
-        
+
         When n_consensus_samples > 1, queries the VLM multiple times and
         takes the majority-vote object to reduce hallucination risk.
         """
         if self.mock_mode:
-            return self._mock_object_identification(task_result)
+            return self._mock_object_identification(task_result, target_hint=target_hint)
         
         prompt = self.config.step2_object_identification_template.format(
             task_goal=task_result.task_goal,
@@ -504,17 +508,30 @@ class AffordanceReasoner:
         )
     
     def _mock_object_identification(
-        self, task_result: TaskAnalysisResult
+        self,
+        task_result: TaskAnalysisResult,
+        target_hint: Optional[str] = None
     ) -> ObjectIdentificationResult:
-        """Generate mock object identification."""
-        obj_type = task_result.required_object_type
-        
+        """Generate mock object identification.
+
+        If target_hint is provided (the --target flag from the pipeline), use it
+        directly so the mock doesn't hallucinate a wrong object name.
+        """
+        if target_hint:
+            target_object = target_hint
+            description = (f"Mock: using --target hint '{target_hint}' "
+                           f"for {task_result.task_goal.lower()}")
+        else:
+            obj_type = task_result.required_object_type
+            target_object = obj_type.split("(")[0].strip().split("/")[0].strip()
+            description = f"A {obj_type} suitable for {task_result.task_goal.lower()}"
+
         return ObjectIdentificationResult(
-            target_object=obj_type.split("(")[0].strip().split("/")[0].strip(),
-            object_description=f"A {obj_type} suitable for {task_result.task_goal.lower()}",
+            target_object=target_object,
+            object_description=description,
             confidence=0.85,
             approximate_location="center-left of scene",
-            raw_response={"mock": True}
+            raw_response={"mock": True, "target_hint": target_hint}
         )
     
     def _mock_affordance_reasoning(
