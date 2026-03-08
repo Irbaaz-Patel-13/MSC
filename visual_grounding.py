@@ -70,7 +70,11 @@ class VisualAffordanceGrounder:
         # Try to load LangSAM
         try:
             from lang_sam import LangSAM
-            self.lang_sam = LangSAM(sam_type=self.config.sam_variant)
+            try:
+                self.lang_sam = LangSAM(sam_type=self.config.sam_variant)
+            except TypeError:
+                # Older LangSAM versions don't accept sam_type keyword
+                self.lang_sam = LangSAM()
             self.use_langsam = True
             print("[VisualGrounder] LangSAM loaded successfully.")
         except ImportError as e:
@@ -93,6 +97,28 @@ class VisualAffordanceGrounder:
                     "  (sets config.visual_grounding.force_sim_fallback = True)"
                 ) from e
     
+    def offload_to_cpu(self) -> None:
+        """
+        Move LangSAM models from GPU to CPU and release CUDA memory.
+
+        Call this after grounding is complete and before running any other
+        GPU-heavy inference (e.g. Contact-GraspNet) to reclaim VRAM.
+        SAM2 + GroundingDINO together occupy ~5 GB on an RTX 4050; moving them
+        to CPU frees that budget for downstream models.
+        """
+        if not self.use_langsam or self.lang_sam is None:
+            return
+        try:
+            import torch
+            if hasattr(self.lang_sam, 'sam') and hasattr(self.lang_sam.sam, 'model'):
+                self.lang_sam.sam.model.to('cpu')
+            if hasattr(self.lang_sam, 'gdino') and hasattr(self.lang_sam.gdino, 'model'):
+                self.lang_sam.gdino.model.to('cpu')
+            torch.cuda.empty_cache()
+            print("[VisualGrounder] LangSAM offloaded to CPU; CUDA cache cleared.")
+        except Exception as e:
+            print(f"[VisualGrounder] Warning: offload_to_cpu failed: {e}")
+
     def ground(
         self,
         rgb_image: np.ndarray,
@@ -102,7 +128,8 @@ class VisualAffordanceGrounder:
         camera_intrinsics: Optional[np.ndarray] = None,
         camera_extrinsics: Optional[np.ndarray] = None,
         simulation_segmask: Optional[np.ndarray] = None,
-        target_body_id: Optional[int] = None
+        target_body_id: Optional[int] = None,
+        workspace_crop: Optional[Tuple[int, int, int, int]] = "from_config",
     ) -> GroundingResult:
         """
         Ground object and part affordances into pixel masks.
@@ -121,11 +148,19 @@ class VisualAffordanceGrounder:
             GroundingResult with object and affordance masks
         """
         h, w = rgb_image.shape[:2]
-        
+
+        # Resolve workspace_crop: sentinel "from_config" means use config value
+        resolved_crop = (
+            getattr(self.config, "workspace_image_crop", None)
+            if workspace_crop == "from_config"
+            else workspace_crop
+        )
+
         if self.use_langsam:
             result = self._ground_with_langsam(
                 rgb_image, depth_image, target_object, target_part,
-                camera_intrinsics, camera_extrinsics
+                camera_intrinsics, camera_extrinsics,
+                workspace_crop=resolved_crop,
             )
         elif simulation_segmask is not None and target_body_id is not None:
             result = self._ground_with_simulation(
@@ -141,7 +176,95 @@ class VisualAffordanceGrounder:
             )
         
         return result
-    
+
+    def ground_multiview(
+        self,
+        views: List[Tuple[str, "CapturedImage"]],
+        target_object: str,
+        target_part: str,
+        simulation_segmask: Optional[np.ndarray] = None,
+        target_body_id: Optional[int] = None,
+    ) -> Tuple["GroundingResult", "CapturedImage", str]:
+        """
+        Run grounding on every captured view and return the result from the
+        best-scoring view.
+
+        Scoring formula (balances detection confidence with mask coverage):
+            score = confidence × sqrt(mask_area_px / total_px)
+
+        Args:
+            views: List of (view_name, CapturedImage) from capture_multiview_rgbd()
+            target_object: Object name from VLM reasoning
+            target_part: Graspable part name from VLM reasoning
+            simulation_segmask: PyBullet segmask for simulation fallback
+            target_body_id: PyBullet body ID for simulation fallback
+
+        Returns:
+            (best_result, best_image, best_view_name)
+        """
+        best_result: Optional[GroundingResult] = None
+        best_image = None
+        best_view_name = "top"
+        best_score = -1.0
+
+        # workspace_image_crop was calibrated for the top-down camera only;
+        # disable it for front/side views so we don't crop out the target object.
+        top_crop = getattr(self.config, "workspace_image_crop", None)
+
+        for view_name, image_data in views:
+            print(f"[Grounding] Trying view: {view_name}")
+            view_crop = top_crop if view_name == "top" else None
+            try:
+                result = self.ground(
+                    rgb_image=image_data.rgb,
+                    depth_image=image_data.depth,
+                    target_object=target_object,
+                    target_part=target_part,
+                    camera_intrinsics=image_data.camera_intrinsics,
+                    camera_extrinsics=image_data.camera_extrinsics,
+                    simulation_segmask=simulation_segmask,
+                    target_body_id=target_body_id,
+                    workspace_crop=view_crop,
+                )
+            except Exception as e:
+                print(f"[Grounding]   view '{view_name}' failed: {e}")
+                continue
+
+            h, w = image_data.rgb.shape[:2]
+            total_px = h * w
+            mask_area = int(result.affordance_mask.sum())
+            score = result.confidence * (mask_area / total_px) ** 0.5
+            print(
+                f"[Grounding]   view '{view_name}': confidence={result.confidence:.3f}  "
+                f"mask_area={mask_area}px  score={score:.4f}"
+            )
+
+            if score > best_score:
+                best_score = score
+                best_result = result
+                best_image = image_data
+                best_view_name = view_name
+
+        if best_result is None:
+            # All views failed — return the top-down result even if it errored
+            print("[Grounding] All views failed — falling back to primary view.")
+            _, primary = views[0]
+            best_result = self.ground(
+                rgb_image=primary.rgb,
+                depth_image=primary.depth,
+                target_object=target_object,
+                target_part=target_part,
+                camera_intrinsics=primary.camera_intrinsics,
+                camera_extrinsics=primary.camera_extrinsics,
+                simulation_segmask=simulation_segmask,
+                target_body_id=target_body_id,
+            )
+            best_image = primary
+            best_view_name = views[0][0]
+
+        print(f"[Grounding] Best view: '{best_view_name}' (score={best_score:.4f})")
+        return best_result, best_image, best_view_name
+
     # =========================================================================
     #  Method 1: LangSAM-based Grounding (Paper's approach)
     # =========================================================================
@@ -153,7 +276,8 @@ class VisualAffordanceGrounder:
         target_object: str,
         target_part: str,
         camera_intrinsics: Optional[np.ndarray],
-        camera_extrinsics: Optional[np.ndarray]
+        camera_extrinsics: Optional[np.ndarray],
+        workspace_crop: Optional[Tuple[int, int, int, int]] = None,
     ) -> GroundingResult:
         """
         Full LangSAM-based grounding matching the paper's two-pass approach.
@@ -166,44 +290,75 @@ class VisualAffordanceGrounder:
         Supports both LangSAM v0.1.x (single-image API) and v0.2.x (batched API).
         """
         from PIL import Image
-        
+
         pil_image = Image.fromarray(rgb_image)
         h, w = rgb_image.shape[:2]
         pad = self.config.crop_padding
-        
+
+        # ---- Workspace crop: exclude robot arm from LangSAM input ----
+        # The robot arm appears on the left edge of the top-down camera image.
+        # Cropping to the workspace region prevents LangSAM from confusing the
+        # robot with the target object (which shares no texture cues when objects
+        # appear as dark silhouettes).
+        roi = workspace_crop
+        if roi is not None:
+            rx1, ry1, rx2, ry2 = roi
+            rx1, ry1, rx2, ry2 = (max(0, rx1), max(0, ry1),
+                                   min(w, rx2), min(h, ry2))
+            search_pil = pil_image.crop((rx1, ry1, rx2, ry2))
+            roi_offset = (rx1, ry1)
+        else:
+            search_pil = pil_image
+            roi_offset = (0, 0)
+
         # ---- Pass 1: Segment the full target object ----
-        # Use a short noun phrase with trailing period for best GroundingDINO results
-        object_query = f"{target_object}."
-        obj_result = self._langsam_predict(pil_image, object_query)
-        
+        # Combine object + part into a single descriptive phrase to disambiguate
+        # visually similar objects (e.g. "lid with handle." vs just "lid." which
+        # incorrectly matches bowls). Falls back to bare object name if the
+        # combined query returns no detections.
+        combined_query = f"{target_object.lower().strip()} with {target_part.lower().strip()}."
+        obj_result = self._langsam_predict(search_pil, combined_query)
+        if obj_result is None or len(obj_result["masks"]) == 0:
+            object_query = target_object.lower().strip() + "."
+            print(f"[VisualGrounder] Combined query '{combined_query}' gave no results; "
+                  f"falling back to '{object_query}'")
+            obj_result = self._langsam_predict(search_pil, object_query)
+
         if obj_result is None or len(obj_result["masks"]) == 0:
             print(f"[VisualGrounder] Warning: No object found for '{target_object}'")
             return self._empty_result(h, w, target_object, target_part)
-        
+
         # Take the highest-confidence detection
         best_idx = obj_result["scores"].argmax()
-        object_mask = obj_result["masks"][best_idx].astype(np.uint8)
+        sw, sh = search_pil.size  # search image dimensions (may be a crop)
+        ox, oy = roi_offset        # offset of search image within full image
+
+        # Map object mask from search_pil → full image
+        object_mask_crop = obj_result["masks"][best_idx].astype(np.uint8)
+        object_mask = np.zeros((h, w), dtype=np.uint8)
+        object_mask[oy:oy + sh, ox:ox + sw] = object_mask_crop
+
+        # Denormalise box using search image size, then shift by roi_offset
         obj_box_raw = obj_result["boxes"][best_idx]
-        
-        # Normalised boxes need denormalisation
         if obj_box_raw.max() <= 1.0:
             obj_box = [
-                int(obj_box_raw[0] * w), int(obj_box_raw[1] * h),
-                int(obj_box_raw[2] * w), int(obj_box_raw[3] * h)
+                int(obj_box_raw[0] * sw) + ox, int(obj_box_raw[1] * sh) + oy,
+                int(obj_box_raw[2] * sw) + ox, int(obj_box_raw[3] * sh) + oy,
             ]
         else:
-            obj_box = [int(v) for v in obj_box_raw]
-        
+            obj_box = [int(obj_box_raw[0]) + ox, int(obj_box_raw[1]) + oy,
+                       int(obj_box_raw[2]) + ox, int(obj_box_raw[3]) + oy]
+
         # ---- Pass 2: Crop and segment the part ----
-        # Crop to object bounding box with padding (research: 20px padding)
+        # Crop from the full image, centred on the detected object bbox
         x1 = max(0, obj_box[0] - pad)
         y1 = max(0, obj_box[1] - pad)
         x2 = min(w, obj_box[2] + pad)
         y2 = min(h, obj_box[3] + pad)
         cropped = pil_image.crop((x1, y1, x2, y2))
         
-        # Use short noun phrase for part — "handle.", "blade.", "rim."
-        part_query = f"{target_part}."
+        # GroundingDINO requires lowercase + trailing period
+        part_query = target_part.lower().strip() + "."
         part_result = self._langsam_predict(cropped, part_query)
         
         if part_result is not None and len(part_result["masks"]) > 0:
@@ -257,49 +412,43 @@ class VisualAffordanceGrounder:
     
     def _langsam_predict(self, pil_image, text_prompt: str) -> Optional[dict]:
         """
-        Wrapper for LangSAM predict that handles both v0.1.x and v0.2.x APIs.
-        
-        Returns dict with keys: masks (N,H,W np.array), boxes (N,4), scores (N,).
+        Wrapper for the installed LangSAM v0.2+ API.
+
+        The installed version expects:
+            predict(images_pil: list[Image], texts_prompt: list[str],
+                    box_threshold, text_threshold)
+            → list[dict]  with keys: boxes, scores, masks, mask_scores (all np.ndarray)
+
+        Returns dict with keys: masks (N,H,W), boxes (N,4), scores (N,) — all np.ndarray.
+        Returns None if no detections or on error.
         """
-        import torch
-        
         try:
-            # Try v0.2.x batched API first
-            results = self.lang_sam.predict([pil_image], [text_prompt])
-            if isinstance(results, list) and len(results) > 0:
-                r = results[0]
-                masks_t = r.get("masks", r.get("segmentation", torch.tensor([])))
-                boxes_t = r.get("boxes", torch.tensor([]))
-                scores_t = r.get("scores", r.get("logits", torch.tensor([])))
-                
-                if isinstance(masks_t, torch.Tensor) and masks_t.numel() > 0:
-                    return {
-                        "masks": masks_t.cpu().numpy(),
-                        "boxes": boxes_t.cpu().numpy(),
-                        "scores": scores_t.cpu().numpy()
-                    }
-        except TypeError:
-            pass  # v0.2.x API not supported, fall through
-        except Exception:
-            pass
-        
-        try:
-            # Fall back to v0.1.x single-image API
-            masks, boxes, phrases, logits = self.lang_sam.predict(
-                pil_image, text_prompt,
+            results = self.lang_sam.predict(
+                [pil_image], [text_prompt],
                 box_threshold=self.config.box_threshold,
                 text_threshold=self.config.text_threshold
             )
-            if isinstance(masks, torch.Tensor) and masks.numel() > 0:
-                return {
-                    "masks": masks.cpu().numpy(),
-                    "boxes": boxes.cpu().numpy(),
-                    "scores": logits.cpu().numpy()
-                }
+            if not results:
+                return None
+            r = results[0]
+
+            masks = r.get("masks", [])
+            boxes = r.get("boxes", [])
+            scores = r.get("scores", [])
+
+            if len(masks) == 0:
+                return None
+
+            return {
+                "masks": np.asarray(masks),   # (N, H, W)
+                "boxes": np.asarray(boxes),   # (N, 4)
+                "scores": np.asarray(scores)  # (N,)
+            }
         except Exception as e:
             print(f"[VisualGrounder] LangSAM predict failed: {e}")
-        
-        return None
+            import traceback
+            traceback.print_exc()
+            return None
     
     # =========================================================================
     #  Method 2: Simulation Segmentation Fallback

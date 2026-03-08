@@ -1,0 +1,27 @@
+{
+  "instruction": "I want to drink some coffee.",
+  "target_category": "mug",
+  "timestamp": "20260304_124358",
+  "success": false,
+  "num_objects": 6,
+  "reasoning": {
+    "task_goal": "Drink a beverage",
+    "target_object": "mug",
+    "optimal_part": "handle",
+    "approach": "side"
+  },
+  "grounding": {
+    "affordance_center_px": [
+      64,
+      196
+    ],
+    "affordance_center_3d": [
+      0.21987984716330122,
+      0.04814565016425783,
+      0.7451416254043579
+    ],
+    "confidence": 0.4315841495990753,
+    "mask_area_px": 12665
+  },
+  "grasps": []
+}

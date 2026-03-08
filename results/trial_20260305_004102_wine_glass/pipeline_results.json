@@ -1,0 +1,53 @@
+{
+  "instruction": "I want to cover a skillet with a lid.",
+  "target_category": "wine_glass",
+  "timestamp": "20260305_004102",
+  "success": true,
+  "num_objects": 6,
+  "reasoning": {
+    "task_goal": "Cover the skillet to retain heat and moisture.",
+    "target_object": "lid",
+    "optimal_part": "handle",
+    "approach": "top"
+  },
+  "grounding": {
+    "affordance_center_px": [
+      144,
+      160
+    ],
+    "affordance_center_3d": [
+      0.30271198126669463,
+      1.0106933708355015,
+      0.003448351837724961
+    ],
+    "confidence": 0.35042136907577515,
+    "mask_area_px": 13264
+  },
+  "grasps": [
+    {
+      "position": [
+        0.36162524270571683,
+        0.01972559500260951,
+        0.3241482731097992
+      ],
+      "orientation": [
+        0.6973387052332152,
+        -0.20638513343855663,
+        -0.664169609015566,
+        -0.1732126939324094
+      ],
+      "width": 0.016916528344154358,
+      "quality_score": 0.160866841673851,
+      "affordance_score": 0.17803291151314926,
+      "combined_score": 0.9035792332249176
+    }
+  ],
+  "grasp_executed": {
+    "position": [
+      0.36162524270571683,
+      0.01972559500260951,
+      0.3241482731097992
+    ],
+    "combined_score": 0.9035792332249176
+  }
+}

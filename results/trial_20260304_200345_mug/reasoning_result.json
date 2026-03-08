@@ -1,0 +1,6 @@
+{
+  "task_goal": "Cover the pot to retain heat or prevent spillage.",
+  "target_object": "lid",
+  "optimal_part": "handle",
+  "approach": "top"
+}

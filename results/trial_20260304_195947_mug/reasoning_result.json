@@ -1,0 +1,6 @@
+{
+  "task_goal": "Secure screws into a surface or object",
+  "target_object": "screwdriver",
+  "optimal_part": "handle",
+  "approach": "side"
+}

@@ -1,0 +1,6 @@
+{
+  "task_goal": "Drink a beverage",
+  "target_object": "mug",
+  "optimal_part": "handle",
+  "approach": "side"
+}

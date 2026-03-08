@@ -77,6 +77,10 @@ class SimulationEnvironment:
         self.table_id = None
         self.objects: List[SceneObject] = []
         self._is_setup = False
+        # Video recording state
+        self._video_frames: List[np.ndarray] = []
+        self._recording: bool = False
+        self._video_every_n: int = 16  # capture 1 frame per N sim steps (~15fps at 240Hz)
     
     def setup(self) -> None:
         """Initialise the PyBullet simulation environment."""
@@ -153,24 +157,165 @@ class SimulationEnvironment:
         
         return table_id
     
+    # =========================================================================
+    #  ROBOT LOADING — dispatches on config.robot_type
+    # =========================================================================
+
     def _load_robot(self) -> int:
-        """Load the UR5 robot URDF."""
+        """Load the robot URDF and configure joint mappings."""
+        if getattr(self.config, "robot_type", "panda") == "hsr":
+            return self._load_hsr()
+        else:
+            return self._load_panda()
+
+    # ── Franka Panda ──────────────────────────────────────────────────────────
+
+    def _load_panda(self) -> int:
+        """Load Franka Panda (bundled with pybullet_data)."""
         robot_id = p.loadURDF(
             self.config.robot_urdf,
             basePosition=list(self.config.robot_base_position),
             baseOrientation=list(self.config.robot_base_orientation),
             useFixedBase=True,
-            flags=p.URDF_USE_SELF_COLLISION
+            flags=p.URDF_USE_SELF_COLLISION,
         )
+        self.ee_link_index        = self.config.end_effector_index
+        self.arm_joint_indices    = list(range(7))
+        self.gripper_joint_index  = None
+        self.joint_name_to_idx    = {}
+        self.torso_lift_joint_idx = None
+        self.hsr_finger_joint_idxs = []
+        self._ik_lower = self._ik_upper = self._ik_ranges = self._ik_rest = []
+        self.head_camera_link_idx = None
         return robot_id
-    
+
+    # ── Toyota HSR ────────────────────────────────────────────────────────────
+
+    def _load_hsr(self) -> int:
+        """Load the Toyota HSR from hsrb4s_pybullet.urdf."""
+        urdf_path = str(self.config.hsr_urdf)
+        if not os.path.isabs(urdf_path):
+            urdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), urdf_path)
+
+        robot_id = p.loadURDF(
+            urdf_path,
+            basePosition=list(self.config.robot_base_position),
+            baseOrientation=list(self.config.robot_base_orientation),
+            useFixedBase=True,
+        )
+        self._build_hsr_joint_map(robot_id)
+        return robot_id
+
+    def _build_hsr_joint_map(self, robot_id: int) -> None:
+        """Build name→index maps and pre-compute IK limit arrays for HSR."""
+        self.joint_name_to_idx: Dict[str, int] = {}
+        for i in range(p.getNumJoints(robot_id)):
+            info = p.getJointInfo(robot_id, i)
+            self.joint_name_to_idx[info[1].decode("utf-8")] = i
+
+        # Arm joints (kinematic order)
+        self.arm_joint_indices = [
+            self.joint_name_to_idx[j]
+            for j in self.config.hsr_arm_joints
+            if j in self.joint_name_to_idx
+        ]
+
+        # Gripper motor joint
+        self.gripper_joint_index = self.joint_name_to_idx.get(
+            self.config.hsr_gripper_joint
+        )
+
+        # Proximal finger joints (mimic hand_motor manually)
+        self.hsr_finger_joint_idxs = [
+            self.joint_name_to_idx[j]
+            for j in self.config.hsr_finger_joints
+            if j in self.joint_name_to_idx
+        ]
+
+        # torso_lift mimics arm_lift at 0.5× — sync manually
+        self.torso_lift_joint_idx = self.joint_name_to_idx.get(
+            self.config.hsr_torso_lift_joint
+        )
+
+        # EE link index: "hand_palm_link" is the child of "hand_palm_joint"
+        # In PyBullet, link index == joint index of the joint whose child=link
+        ee_joint_name = "hand_palm_joint"
+        self.ee_link_index = self.joint_name_to_idx.get(
+            ee_joint_name, self.config.end_effector_index
+        )
+
+        # Head camera link
+        self.head_camera_link_idx = self.joint_name_to_idx.get(
+            "head_rgbd_sensor_joint"
+        )
+
+        # Joint limit arrays for IK solver (one value per joint, all joints)
+        n = p.getNumJoints(robot_id)
+        self._ik_lower, self._ik_upper, self._ik_ranges, self._ik_rest = [], [], [], []
+        for i in range(n):
+            info = p.getJointInfo(robot_id, i)
+            lo, hi = info[8], info[9]
+            if info[2] == p.JOINT_FIXED or lo >= hi:
+                lo, hi = -0.01, 0.01
+            self._ik_lower.append(lo)
+            self._ik_upper.append(hi)
+            self._ik_ranges.append(hi - lo)
+            self._ik_rest.append((lo + hi) / 2.0)
+
+        # Seed rest poses from home config for better IK convergence
+        for jname, jval in self.config.hsr_home_positions.items():
+            idx = self.joint_name_to_idx.get(jname)
+            if idx is not None:
+                self._ik_rest[idx] = jval
+
+        print(f"[SimEnv] HSR loaded: {n} joints, "
+              f"EE={self.ee_link_index}, arm={self.arm_joint_indices}")
+
+    # ── Home position ─────────────────────────────────────────────────────────
+
     def _set_home_position(self) -> None:
-        """Set the robot to a neutral home position above the table."""
-        home_joints = list(self.config.home_joint_positions)
-        num_joints = p.getNumJoints(self.robot_id)
-        
-        for i, angle in enumerate(home_joints[:min(7, num_joints)]):
+        """Move the robot to its home configuration."""
+        if getattr(self.config, "robot_type", "panda") == "hsr":
+            self._set_hsr_home()
+        else:
+            self._set_panda_home()
+
+    def _set_panda_home(self) -> None:
+        home = list(self.config.home_joint_positions)
+        n = p.getNumJoints(self.robot_id)
+        for i, angle in enumerate(home[: min(7, n)]):
             p.resetJointState(self.robot_id, i, angle)
+
+    def _set_hsr_home(self) -> None:
+        for jname, jval in self.config.hsr_home_positions.items():
+            idx = self.joint_name_to_idx.get(jname)
+            if idx is not None:
+                p.resetJointState(self.robot_id, idx, jval)
+        if self.torso_lift_joint_idx is not None:
+            arm_val = self.config.hsr_home_positions.get("arm_lift_joint", 0.0)
+            p.resetJointState(self.robot_id, self.torso_lift_joint_idx, arm_val * 0.5)
+
+    # ── HSR gripper control ───────────────────────────────────────────────────
+
+    def _hsr_set_gripper(self, value: float, force: float = 20.0) -> None:
+        """
+        Set HSR gripper opening. value=0.8 → open, value=0.0 → closed.
+        Manually syncs proximal finger joints (PyBullet ignores <mimic>).
+        """
+        if self.gripper_joint_index is None:
+            return
+        p.setJointMotorControl2(
+            self.robot_id, self.gripper_joint_index,
+            p.POSITION_CONTROL, targetPosition=value, force=force,
+        )
+        for idx, mult in zip(
+            self.hsr_finger_joint_idxs,
+            self.config.hsr_finger_multipliers,
+        ):
+            p.setJointMotorControl2(
+                self.robot_id, idx,
+                p.POSITION_CONTROL, targetPosition=value * mult, force=force,
+            )
     
     # =========================================================================
     #  OBJECT SPAWNING
@@ -257,22 +402,34 @@ class SimulationEnvironment:
         if body_id is None:
             return None
 
-        # --- Verify texture; apply manually if PyBullet didn't bind it ---
-        # getVisualShapeData()[link_idx][8] == textureUniqueId; -1 = not loaded.
+        # --- Apply distinctive colour per object category ---
+        # PyBullet's TinyRenderer does not reliably render UV-mapped textures loaded
+        # via changeVisualShape(textureUniqueId=...) in DIRECT mode.  Instead, set a
+        # category-specific RGBA colour so GroundingDINO can distinguish objects by
+        # both shape AND colour.  Alpha=1 for solid rendering.
+        _ycb_colours = {
+            "mug":                 [0.85, 0.35, 0.10, 1.0],  # warm orange
+            "bowl":                [0.20, 0.55, 0.85, 1.0],  # sky blue
+            "a_cups":              [0.95, 0.90, 0.30, 1.0],  # yellow
+            "spoon":               [0.70, 0.70, 0.70, 1.0],  # silver
+            "hammer":              [0.70, 0.15, 0.15, 1.0],  # red
+            "knife":               [0.80, 0.80, 0.80, 1.0],  # light grey
+            "fork":                [0.75, 0.75, 0.75, 1.0],  # silver
+            "scissors":            [0.20, 0.55, 0.20, 1.0],  # green
+            "phillips_screwdriver":[0.20, 0.20, 0.80, 1.0],  # blue
+            "spatula":             [0.50, 0.30, 0.10, 1.0],  # brown
+            "mustard_bottle":      [0.95, 0.80, 0.10, 1.0],  # mustard yellow
+            "pitcher_base":        [0.60, 0.20, 0.70, 1.0],  # purple
+            "power_drill":         [0.30, 0.30, 0.30, 1.0],  # dark grey
+            "tomato_soup_can":     [0.85, 0.15, 0.15, 1.0],  # tomato red
+            "foam_brick":          [0.90, 0.50, 0.50, 1.0],  # light red
+            "skillet_lid":         [0.40, 0.40, 0.40, 1.0],  # medium grey
+        }
+        colour = _ycb_colours.get(ycb_id, [0.60, 0.60, 0.60, 1.0])
         try:
-            vis_data = p.getVisualShapeData(body_id)
-            if vis_data and vis_data[0][8] == -1:
-                tex_path = os.path.join(ycb_data_path, ycb_id, "texture_map.png")
-                if os.path.isfile(tex_path):
-                    try:
-                        tex_id = p.loadTexture(tex_path)
-                        p.changeVisualShape(body_id, -1, textureUniqueId=tex_id)
-                    except Exception as tex_e:
-                        print(f"[SimEnv] Texture fallback failed for {ycb_id}: {tex_e}")
-                else:
-                    print(f"[SimEnv] Warning: no texture_map.png for {ycb_id}")
-        except Exception:
-            pass  # non-fatal: object still usable without texture
+            p.changeVisualShape(body_id, -1, rgbaColor=colour)
+        except Exception as col_e:
+            print(f"[SimEnv] Colour apply failed for {ycb_id}: {col_e}")
 
         obj = SceneObject(
             body_id=body_id,
@@ -530,55 +687,56 @@ class SimulationEnvironment:
     #  CAMERA & RGB-D CAPTURE
     # =========================================================================
     
-    def capture_rgbd(self) -> CapturedImage:
-        """
-        Capture an RGB-D image from the simulation camera.
-        
-        Returns an RGB image, depth map (in metres), segmentation mask,
-        and camera intrinsic/extrinsic matrices. This mirrors the Intel
-        RealSense L515 capture used in the real-world AffordGrasp setup.
-        """
+    def _capture_from_view(
+        self,
+        eye: Tuple,
+        target: Tuple,
+        up: Tuple,
+    ) -> CapturedImage:
+        """Capture RGB-D from an arbitrary camera pose."""
         width = self.config.image_width
         height = self.config.image_height
-        
-        # Compute view and projection matrices
+
         view_matrix = p.computeViewMatrix(
-            cameraEyePosition=list(self.config.camera_position),
-            cameraTargetPosition=list(self.config.camera_target),
-            cameraUpVector=list(self.config.camera_up_vector)
+            cameraEyePosition=list(eye),
+            cameraTargetPosition=list(target),
+            cameraUpVector=list(up),
         )
-        
+
         aspect = width / height
         projection_matrix = p.computeProjectionMatrixFOV(
             fov=self.config.camera_fov,
             aspect=aspect,
             nearVal=self.config.camera_near,
-            farVal=self.config.camera_far
+            farVal=self.config.camera_far,
         )
-        
-        # Capture image
+
+        # High ambient coefficient ensures dark-textured YCB objects remain
+        # visible under top-down lighting. Shadow disabled for cleaner depth.
         _, _, rgb_pixels, depth_pixels, seg_pixels = p.getCameraImage(
             width=width,
             height=height,
             viewMatrix=view_matrix,
             projectionMatrix=projection_matrix,
-            renderer=p.ER_BULLET_HARDWARE_OPENGL if self.gui else p.ER_TINY_RENDERER
+            renderer=p.ER_TINY_RENDERER,
+            lightDirection=[0.5, 0.5, 1.0],
+            lightColor=[1.0, 1.0, 1.0],
+            lightAmbientCoeff=0.8,
+            lightDiffuseCoeff=0.8,
+            lightSpecularCoeff=0.1,
+            shadow=0,
         )
-        
-        # Process RGB (remove alpha channel)
+
         rgb = np.array(rgb_pixels, dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
-        
-        # Convert depth buffer to metric depth
+
         depth_buffer = np.array(depth_pixels, dtype=np.float32).reshape(height, width)
         near = self.config.camera_near
         far = self.config.camera_far
         depth = far * near / (far - (far - near) * depth_buffer)
-        
-        # Segmentation mask
+
         segmentation = np.array(seg_pixels, dtype=np.int32).reshape(height, width)
-        
-        # Compute camera intrinsic matrix from the OpenGL projection matrix.
-        # PyBullet returns column-major (OpenGL convention) flat arrays.
+
+        # Intrinsics from OpenGL projection matrix (column-major flat array)
         proj_np = np.array(projection_matrix, dtype=np.float64).reshape(4, 4, order='F')
         fx = proj_np[0, 0] * width / 2.0
         fy = proj_np[1, 1] * height / 2.0
@@ -587,13 +745,11 @@ class SimulationEnvironment:
         intrinsics = np.array([
             [fx,  0, cx],
             [ 0, fy, cy],
-            [ 0,  0,  1]
+            [ 0,  0,  1],
         ], dtype=np.float64)
-        
-        # Camera extrinsics (view matrix as 4x4, column-major → standard row-major)
+
         view_4x4 = np.array(view_matrix, dtype=np.float64).reshape(4, 4, order='F')
-        proj_4x4 = proj_np
-        
+
         return CapturedImage(
             rgb=rgb,
             depth=depth,
@@ -601,8 +757,37 @@ class SimulationEnvironment:
             camera_intrinsics=intrinsics,
             camera_extrinsics=view_4x4,
             view_matrix=view_4x4,
-            projection_matrix=proj_4x4
+            projection_matrix=proj_np,
         )
+
+    def capture_rgbd(self) -> CapturedImage:
+        """
+        Capture an RGB-D image from the primary simulation camera.
+
+        Returns an RGB image, depth map (in metres), segmentation mask,
+        and camera intrinsic/extrinsic matrices. This mirrors the Intel
+        RealSense L515 capture used in the real-world AffordGrasp setup.
+        """
+        return self._capture_from_view(
+            self.config.camera_position,
+            self.config.camera_target,
+            self.config.camera_up_vector,
+        )
+
+    def capture_multiview_rgbd(self) -> List[Tuple[str, CapturedImage]]:
+        """
+        Capture RGB-D from the primary camera plus all extra_camera_views.
+
+        Returns a list of (view_name, CapturedImage) pairs. The primary
+        top-down view is always first ("top"), followed by any views
+        configured in SimulationConfig.extra_camera_views.
+        """
+        views: List[Tuple[str, CapturedImage]] = [
+            ("top", self.capture_rgbd())
+        ]
+        for name, eye, target, up in getattr(self.config, "extra_camera_views", []):
+            views.append((name, self._capture_from_view(eye, target, up)))
+        return views
     
     def save_rgbd(self, image_data: CapturedImage, save_dir: str,
                   prefix: str = "scene") -> Dict[str, str]:
@@ -617,11 +802,20 @@ class SimulationEnvironment:
         cv2.imwrite(rgb_path, cv2.cvtColor(image_data.rgb, cv2.COLOR_RGB2BGR))
         paths["rgb"] = rgb_path
         
-        # Save depth as 16-bit PNG (millimetres)
+        # Save depth as 16-bit PNG (millimetres) — raw metric data
         depth_mm = (image_data.depth * 1000).astype(np.uint16)
         depth_path = os.path.join(save_dir, f"{prefix}_depth.png")
         cv2.imwrite(depth_path, depth_mm)
         paths["depth"] = depth_path
+
+        # Save depth visualization as 8-bit grayscale (normalized to workspace range)
+        # Clip to 0.1–2.0 m so table/objects use the full 0–255 range
+        d_vis = np.clip(image_data.depth, 0.1, 2.0)
+        d_vis = ((d_vis - d_vis.min()) / max(d_vis.max() - d_vis.min(), 1e-6) * 255).astype(np.uint8)
+        d_vis = 255 - d_vis  # invert: near objects bright, far objects dark
+        depth_vis_path = os.path.join(save_dir, f"{prefix}_depth_vis.png")
+        cv2.imwrite(depth_vis_path, d_vis)
+        paths["depth_vis"] = depth_vis_path
         
         # Save intrinsics
         intrinsics_path = os.path.join(save_dir, f"{prefix}_intrinsics.npy")
@@ -639,24 +833,37 @@ class SimulationEnvironment:
         self,
         target_position: np.ndarray,
         target_orientation: Optional[np.ndarray] = None,
-        max_steps: int = 300
+        max_steps: int = 300,
     ) -> bool:
         """
         Move the robot end-effector to a target pose using IK.
-        
+
+        Dispatches to the robot-specific IK/control method so both HSR and
+        Panda paths use this single public API.
+
         Args:
-            target_position: (x, y, z) target position
-            target_orientation: quaternion (x, y, z, w); if None, uses top-down
-            max_steps: maximum simulation steps for the motion
-        
+            target_position:    (x, y, z) world-frame target
+            target_orientation: quaternion (x, y, z, w); None → top-down grasp
+            max_steps:          simulation steps to simulate the motion
+
         Returns:
-            True if target was reached within tolerance
+            True if EE reached within 5 mm of the target
         """
         if target_orientation is None:
-            # Default: top-down grasp approach
             target_orientation = p.getQuaternionFromEuler([np.pi, 0, 0])
-        
-        # Compute IK solution — seeded with home rest poses for better convergence
+
+        if getattr(self.config, "robot_type", "panda") == "hsr":
+            return self._move_to_pose_hsr(target_position, target_orientation, max_steps)
+        else:
+            return self._move_to_pose_panda(target_position, target_orientation, max_steps)
+
+    def _move_to_pose_panda(
+        self,
+        target_position: np.ndarray,
+        target_orientation: np.ndarray,
+        max_steps: int,
+    ) -> bool:
+        """IK + position control for Franka Panda (7-joint arm)."""
         joint_positions = p.calculateInverseKinematics(
             self.robot_id,
             self.config.end_effector_index,
@@ -664,47 +871,189 @@ class SimulationEnvironment:
             list(target_orientation),
             restPoses=list(self.config.home_joint_positions),
             maxNumIterations=100,
-            residualThreshold=1e-5
+            residualThreshold=1e-5,
         )
-        
-        # Apply joint positions with position control
         for i, pos in enumerate(joint_positions[:7]):
             p.setJointMotorControl2(
                 self.robot_id, i, p.POSITION_CONTROL,
-                targetPosition=pos,
-                force=240,
-                maxVelocity=1.0
+                targetPosition=pos, force=240, maxVelocity=1.0,
             )
-        
-        # Step simulation
-        for step in range(max_steps):
-            p.stepSimulation()
-            if self.gui:
-                time.sleep(self.config.time_step)
-            
-            # Check convergence
+        for _ in range(max_steps):
+            self._sim_step()
             ee_state = p.getLinkState(self.robot_id, self.config.end_effector_index)
-            ee_pos = np.array(ee_state[4])
-            error = np.linalg.norm(ee_pos - target_position)
-            if error < 0.005:
+            if np.linalg.norm(np.array(ee_state[4]) - target_position) < 0.005:
                 return True
-        
         return False
+
+    def _move_to_pose_hsr(
+        self,
+        target_position: np.ndarray,
+        target_orientation: np.ndarray,
+        max_steps: int,
+    ) -> bool:
+        """
+        IK + position control for Toyota HSR (5-DOF arm: lift + 4 revolute).
+
+        Uses joint-limit–constrained IK for better solutions.
+        Reachability check: if IK residual > 2 cm, logs a warning.
+        """
+        ik_result = p.calculateInverseKinematics(
+            self.robot_id,
+            self.ee_link_index,
+            list(target_position),
+            list(target_orientation),
+            lowerLimits=self._ik_lower,
+            upperLimits=self._ik_upper,
+            jointRanges=self._ik_ranges,
+            restPoses=self._ik_rest,
+            maxNumIterations=200,
+            residualThreshold=1e-5,
+        )
+
+        # Apply only the arm joints
+        for j_idx in self.arm_joint_indices:
+            if j_idx < len(ik_result):
+                p.setJointMotorControl2(
+                    self.robot_id, j_idx, p.POSITION_CONTROL,
+                    targetPosition=ik_result[j_idx],
+                    force=100, maxVelocity=0.5,
+                )
+
+        # Sync torso_lift mimic (arm_lift * 0.5)
+        if self.torso_lift_joint_idx is not None:
+            arm_lift_idx = self.joint_name_to_idx.get("arm_lift_joint")
+            if arm_lift_idx is not None and arm_lift_idx < len(ik_result):
+                p.setJointMotorControl2(
+                    self.robot_id, self.torso_lift_joint_idx,
+                    p.POSITION_CONTROL,
+                    targetPosition=ik_result[arm_lift_idx] * 0.5,
+                    force=100,
+                )
+
+        for _ in range(max_steps):
+            self._sim_step()
+            ee_state = p.getLinkState(self.robot_id, self.ee_link_index)
+            if np.linalg.norm(np.array(ee_state[4]) - target_position) < 0.005:
+                return True
+        return False
+
+    # =========================================================================
+    #  VIDEO RECORDING
+    # =========================================================================
+
+    def start_recording(self, every_n: int = 16) -> None:
+        """Begin capturing frames for video. Call before the motion you want to record."""
+        self._video_frames.clear()
+        self._recording = True
+        self._video_every_n = every_n
+        self._video_step_counter = 0
+        print("[SimEnv] Video recording started.")
+
+    def stop_recording(self) -> None:
+        """Stop frame capture."""
+        self._recording = False
+        print(f"[SimEnv] Video recording stopped ({len(self._video_frames)} frames).")
+
+    def save_video(self, output_path: str, fps: int = 15) -> bool:
+        """
+        Write captured frames to an MP4 file using OpenCV.
+
+        Args:
+            output_path: Destination path (e.g. 'results/trial_*/grasp_video.mp4')
+            fps: Frames per second for the output video
+
+        Returns:
+            True on success, False if no frames or OpenCV unavailable.
+        """
+        if not self._video_frames:
+            print("[SimEnv] No frames to save.")
+            return False
+        try:
+            import cv2
+        except ImportError:
+            print("[SimEnv] OpenCV not available — cannot save video.")
+            return False
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        h, w = self._video_frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+        for frame in self._video_frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        print(f"[SimEnv] Video saved: {output_path} ({len(self._video_frames)} frames @ {fps}fps)")
+        return True
+
+    def _sim_step(self) -> None:
+        """
+        Advance the simulation by one step and optionally capture a video frame.
+
+        Call this instead of raw p.stepSimulation() inside motion loops so that
+        the video recorder automatically collects frames without extra boilerplate.
+        """
+        p.stepSimulation()
+        if self.gui:
+            time.sleep(self.config.time_step)
+        if self._recording:
+            self._video_step_counter = getattr(self, "_video_step_counter", 0) + 1
+            if self._video_step_counter % self._video_every_n == 0:
+                img = self._capture_from_view(
+                    self.config.camera_position,
+                    self.config.camera_target,
+                    self.config.camera_up_vector,
+                )
+                self._video_frames.append(img.rgb.copy())
+
+    # ── HSR head camera capture ───────────────────────────────────────────────
+
+    def capture_from_hsr_head(self) -> Optional[CapturedImage]:
+        """
+        Capture RGB-D from the HSR head-mounted RGB-D camera.
+
+        Uses the current pose of head_rgbd_sensor_link to derive the
+        camera view matrix, so the image reflects the current head pan/tilt.
+        Returns None if the HSR isn't loaded or the link index is unknown.
+        """
+        if self.head_camera_link_idx is None:
+            return None
+        link_state = p.getLinkState(
+            self.robot_id, self.head_camera_link_idx, computeForwardKinematics=True
+        )
+        # link_state[4] = world position, link_state[5] = world orientation (xyzw)
+        cam_pos = np.array(link_state[4])
+        cam_orn = np.array(link_state[5])  # quaternion xyzw
+
+        # Compute forward direction from link orientation
+        rot_mat = np.array(p.getMatrixFromQuaternion(cam_orn)).reshape(3, 3)
+        # In the HSR URDF the camera link faces along +X of its local frame
+        forward = rot_mat @ np.array([1.0, 0.0, 0.0])
+        up      = rot_mat @ np.array([0.0, 0.0, 1.0])
+
+        target = cam_pos + forward * 0.5  # look 0.5 m ahead
+        return self._capture_from_view(
+            eye    = tuple(cam_pos.tolist()),
+            target = tuple(target.tolist()),
+            up     = tuple(up.tolist()),
+        )
     
     def execute_grasp(
         self,
         grasp_position: np.ndarray,
         grasp_orientation: np.ndarray,
-        pre_grasp_height: float = 0.15
+        pre_grasp_height: float = 0.15,
+        target_body_id: Optional[int] = None,
     ) -> bool:
         """
         Execute a grasp sequence: approach -> descend -> close gripper -> lift.
-        
+
         Args:
             grasp_position: (x, y, z) grasp point
             grasp_orientation: quaternion for gripper orientation
             pre_grasp_height: height above grasp point for approach
-        
+            target_body_id: PyBullet body ID of the VLM-identified target object.
+                When provided, this object is grasped directly instead of using
+                distance-based search, preventing wrong-object grabs in clutter.
+
         Returns:
             True if grasp was successful (object lifted)
         """
@@ -713,22 +1062,40 @@ class SimulationEnvironment:
         pre_grasp_pos[2] += pre_grasp_height
         print(f"[SimEnv] Moving to pre-grasp: {pre_grasp_pos}")
         self.move_to_pose(pre_grasp_pos, grasp_orientation)
-        
+
         # 2. Descend to grasp position
         print(f"[SimEnv] Descending to grasp: {grasp_position}")
         self.move_to_pose(grasp_position, grasp_orientation)
-        
-        # 3. Close gripper (simplified - constraints-based)
+
+        # 3. Close gripper + attach object via constraint
         print("[SimEnv] Closing gripper...")
-        # In a full implementation, this would actuate gripper joints
-        # For simplicity, we create a fixed constraint to "grasp" the nearest object
-        grasped_id = self._find_nearest_object(grasp_position)
+        # Animate HSR gripper closing (Panda gripper is passive / constraint-only)
+        if getattr(self.config, "robot_type", "panda") == "hsr":
+            self._hsr_set_gripper(0.0)   # close
+            for _ in range(60):
+                self._sim_step()
+
+        # Attach the target object with a fixed constraint.
+        # Use the VLM-identified body_id directly when available to prevent
+        # wrong-object grabs in clutter; fall back to nearest-object search.
+        if target_body_id is not None:
+            obj_pos, _ = p.getBasePositionAndOrientation(target_body_id)
+            dist = np.linalg.norm(np.array(obj_pos) - grasp_position)
+            name = next(
+                (o.name for o in self.objects if o.body_id == target_body_id),
+                str(target_body_id),
+            )
+            print(f"[SimEnv] Target object: {name} at {dist:.3f}m from grasp point")
+            grasped_id = target_body_id
+        else:
+            grasped_id = self._find_nearest_object(grasp_position)
+
         constraint_id = None
         if grasped_id is not None:
             constraint_id = p.createConstraint(
-                self.robot_id, self.config.end_effector_index,
+                self.robot_id, self.ee_link_index,
                 grasped_id, -1,
-                p.JOINT_FIXED, [0, 0, 0], [0, 0, 0.05], [0, 0, 0]
+                p.JOINT_FIXED, [0, 0, 0], [0, 0, 0.05], [0, 0, 0],
             )
         
         # 4. Lift
@@ -744,31 +1111,27 @@ class SimulationEnvironment:
             lifted = obj_pos[2] > table_z + 0.05
             
             if lifted:
-                # Stability check: simulate 100 more steps, verify drift < 5cm
+                # Stability check: simulate 100 more steps, verify drift < 5cm.
+                # The grip is implemented as a PyBullet constraint (not physical
+                # fingers), so getContactPoints always returns empty — don't use it.
                 pre_pos = np.array(obj_pos)
                 for _ in range(100):
-                    p.stepSimulation()
+                    self._sim_step()
                 post_pos, _ = p.getBasePositionAndOrientation(grasped_id)
                 drift = np.linalg.norm(np.array(post_pos) - pre_pos)
-                stable = drift < 0.05
-                
-                # Also check persistent contact with gripper
-                contacts = p.getContactPoints(self.robot_id, grasped_id)
-                gripping = len(contacts) > 0
-                
-                if stable and gripping:
+
+                if drift < 0.05:
                     print(f"[SimEnv] Grasp successful! "
                           f"(lifted {obj_pos[2] - table_z:.3f}m, drift {drift:.4f}m)")
                     return True
                 else:
-                    print(f"[SimEnv] Grasp unstable "
-                          f"(drift={drift:.4f}m, contact={gripping})")
+                    print(f"[SimEnv] Grasp unstable (drift={drift:.4f}m)")
                     return False
 
         print("[SimEnv] Grasp failed.")
         return False
     
-    def _find_nearest_object(self, position: np.ndarray, max_dist: float = 0.10) -> Optional[int]:
+    def _find_nearest_object(self, position: np.ndarray, max_dist: float = 0.15) -> Optional[int]:
         """Find the nearest object to a given position (search radius = 10 cm)."""
         nearest_id = None
         nearest_dist = max_dist

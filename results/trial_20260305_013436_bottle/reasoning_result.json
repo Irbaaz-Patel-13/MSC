@@ -1,0 +1,6 @@
+{
+  "task_goal": "Drive nails into a surface",
+  "target_object": "bottle",
+  "optimal_part": "body",
+  "approach": "top"
+}

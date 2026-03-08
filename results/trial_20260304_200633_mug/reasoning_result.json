@@ -1,0 +1,6 @@
+{
+  "task_goal": "Cover the skillet to retain heat and moisture.",
+  "target_object": "lid",
+  "optimal_part": "handle",
+  "approach": "top"
+}

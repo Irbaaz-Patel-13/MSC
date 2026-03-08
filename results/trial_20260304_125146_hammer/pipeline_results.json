@@ -1,0 +1,27 @@
+{
+  "instruction": "I want to hammer nails.",
+  "target_category": "hammer",
+  "timestamp": "20260304_125146",
+  "success": false,
+  "num_objects": 6,
+  "reasoning": {
+    "task_goal": "Drive nails into a surface",
+    "target_object": "hammer",
+    "optimal_part": "handle",
+    "approach": "side"
+  },
+  "grounding": {
+    "affordance_center_px": [
+      401,
+      327
+    ],
+    "affordance_center_3d": [
+      0.7319642219031981,
+      -0.2491467511431058,
+      0.009559154510498047
+    ],
+    "confidence": 0.4428774416446686,
+    "mask_area_px": 383
+  },
+  "grasps": []
+}
