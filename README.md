@@ -1,6 +1,6 @@
 # AffordGrasp: Reproduction & Execution Strategy
 
-**MSc Robotics & Embedded Systems — Heriot-Watt University**  
+**MSc Robotics — Heriot-Watt University**  
 **Author:** Irbaaz Patel  
 **Reference:** Tang et al., "AffordGrasp: In-Context Affordance Reasoning for Open-Vocabulary Task-Oriented Grasping in Clutter", IROS 2025  
 **Paper:** [arXiv:2503.00778](https://arxiv.org/abs/2503.00778) | **Project:** [eqcy.github.io/affordgrasp](https://eqcy.github.io/affordgrasp/)
