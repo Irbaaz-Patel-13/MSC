@@ -1,2 +1,4 @@
 [submodule "contact_graspnet_pytorch"]
 	url = https://github.com/Irbaaz-Patel-13/contact_graspnet_pytorch.git
+[submodule "hsr_description"]
+	url = https://github.com/Irbaaz-Patel-13/hsr_description.git
