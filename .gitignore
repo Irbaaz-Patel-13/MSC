@@ -2,3 +2,18 @@
 sam_vit_h_4b8939.pth
 *.pth
 
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+results/
+*.log
+repomix-output.xml
+portfolio_figures/
+*.mp4
+.vscode/
+.idea/
+*.swp
