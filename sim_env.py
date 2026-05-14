@@ -692,6 +692,7 @@ class SimulationEnvironment:
         eye: Tuple,
         target: Tuple,
         up: Tuple,
+        fov: Optional[float] = None,
     ) -> CapturedImage:
         """Capture RGB-D from an arbitrary camera pose."""
         width = self.config.image_width
@@ -705,7 +706,7 @@ class SimulationEnvironment:
 
         aspect = width / height
         projection_matrix = p.computeProjectionMatrixFOV(
-            fov=self.config.camera_fov,
+            fov=fov if fov is not None else self.config.camera_fov,
             aspect=aspect,
             nearVal=self.config.camera_near,
             farVal=self.config.camera_far,
@@ -941,12 +942,92 @@ class SimulationEnvironment:
     #  VIDEO RECORDING
     # =========================================================================
 
-    def start_recording(self, every_n: int = 16) -> None:
-        """Begin capturing frames for video. Call before the motion you want to record."""
+    # Wide-angle camera: pulled well back so the full HSR + entire tabletop fit
+    # with clear margin. FOV 75 degrees gives a cinematic 3/4 elevated view.
+    WIDE_EYE    = (-1.5, -1.7, 1.9)
+    WIDE_TARGET = ( 0.5,  0.0,  0.2)
+    WIDE_UP     = ( 0.0,  0.0,  1.0)
+    WIDE_FOV    = 75.0
+
+    # Execution camera: angled side view slightly above table height so the
+    # gripper approach, contact, and lift are all clearly visible.
+    EXEC_EYE    = ( 1.35, -0.85, 0.45)
+    EXEC_TARGET = ( 0.50,  0.00, 0.10)
+    EXEC_UP     = ( 0.0,   0.0,  1.0)
+    EXEC_FOV    = 65.0
+
+    def capture_wide_view(self) -> "CapturedImage":
+        """Capture an RGB-D frame from the wide-angle camera (robot + table in frame)."""
+        return self._capture_from_view(
+            self.WIDE_EYE, self.WIDE_TARGET, self.WIDE_UP, fov=self.WIDE_FOV
+        )
+
+    def add_annotated_frames(
+        self,
+        rgb: np.ndarray,
+        text_lines: List[str],
+        hold_frames: int = 45,
+    ) -> None:
+        """
+        Overlay text onto *rgb* and push *hold_frames* copies into the video buffer.
+
+        Args:
+            rgb:         (H, W, 3) uint8 image (will not be mutated).
+            text_lines:  List of strings drawn top-to-bottom on the frame.
+            hold_frames: How many identical frames to append (15 fps → 45 ≈ 3 s).
+        """
+        try:
+            import cv2
+        except ImportError:
+            self._video_frames.extend([rgb.copy()] * hold_frames)
+            return
+
+        frame = rgb.copy()
+        _, w = frame.shape[:2]
+
+        # Semi-transparent dark banner at the top for readability
+        banner_h = 36 * len(text_lines) + 20
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, banner_h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+        font       = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.72
+        thickness  = 2
+        y          = 38
+        for line in text_lines:
+            # Drop-shadow
+            cv2.putText(frame, line, (12, y + 2), font, font_scale,
+                        (0, 0, 0), thickness + 1, cv2.LINE_AA)
+            cv2.putText(frame, line, (12, y), font, font_scale,
+                        (255, 255, 255), thickness, cv2.LINE_AA)
+            y += 36
+
+        self._video_frames.extend([frame] * hold_frames)
+
+    def start_recording(
+        self,
+        every_n: int = 8,
+        eye: Optional[Tuple] = None,
+        target: Optional[Tuple] = None,
+        up: Optional[Tuple] = None,
+        fov: Optional[float] = None,
+    ) -> None:
+        """
+        Begin capturing frames for video.
+
+        Args:
+            every_n:  Capture one frame per N sim steps (default 8 ≈ 30 fps at 240 Hz).
+            eye/target/up/fov: Camera overrides. Defaults to EXEC_EYE/EXEC_TARGET/EXEC_UP/EXEC_FOV.
+        """
         self._video_frames.clear()
         self._recording = True
         self._video_every_n = every_n
         self._video_step_counter = 0
+        self._rec_eye    = eye    if eye    is not None else self.EXEC_EYE
+        self._rec_target = target if target is not None else self.EXEC_TARGET
+        self._rec_up     = up     if up     is not None else self.EXEC_UP
+        self._rec_fov    = fov    if fov    is not None else self.EXEC_FOV
         print("[SimEnv] Video recording started.")
 
     def stop_recording(self) -> None:
@@ -998,9 +1079,10 @@ class SimulationEnvironment:
             self._video_step_counter = getattr(self, "_video_step_counter", 0) + 1
             if self._video_step_counter % self._video_every_n == 0:
                 img = self._capture_from_view(
-                    self.config.camera_position,
-                    self.config.camera_target,
-                    self.config.camera_up_vector,
+                    getattr(self, "_rec_eye",    self.EXEC_EYE),
+                    getattr(self, "_rec_target", self.EXEC_TARGET),
+                    getattr(self, "_rec_up",     self.EXEC_UP),
+                    fov=getattr(self, "_rec_fov", self.EXEC_FOV),
                 )
                 self._video_frames.append(img.rgb.copy())
 

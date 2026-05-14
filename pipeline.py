@@ -10,7 +10,7 @@ End-to-end pipeline integrating all modules:
 
 This is the main entry point for running the AffordGrasp reproduction.
 
-Author: Irbaaz Patel (MSc Robotics & Embedded Systems, Heriot-Watt University)
+Author: Irbaaz Patel (MSc Robotics, Heriot-Watt University)
 """
 
 import os
@@ -348,6 +348,41 @@ class AffordGraspPipeline:
             print(f"{'='*60}")
 
             if record_video:
+                # --- Phase 1: Prompt display (wide view + instruction text) ---
+                scene_wide = self.sim_env.capture_wide_view()
+                self.sim_env.add_annotated_frames(
+                    scene_wide.rgb,
+                    text_lines=[
+                        f"Task:  \"{instruction}\"",
+                        f"Object:  {results['reasoning']['target_object']}",
+                        f"Grasp:  {results['reasoning']['optimal_part']}",
+                    ],
+                    hold_frames=60,   # 4 s at 15 fps
+                )
+
+                # --- Phase 2: Detection / grounding overlay (45 frames = 3 s) ---
+                try:
+                    import cv2
+                    grounding_vis_path = os.path.join(trial_dir, "grounding_visualisation.png")
+                    if os.path.isfile(grounding_vis_path):
+                        det_img = cv2.cvtColor(
+                            cv2.imread(grounding_vis_path), cv2.COLOR_BGR2RGB
+                        )
+                    else:
+                        det_img = grounding_image.rgb
+                    self.sim_env.add_annotated_frames(
+                        det_img,
+                        text_lines=[
+                            "Stage 2: Visual Affordance Grounding",
+                            f"Detected '{results['reasoning']['optimal_part']}' "
+                            f"on '{results['reasoning']['target_object']}'",
+                        ],
+                        hold_frames=45,   # 3 s at 15 fps
+                    )
+                except Exception:
+                    pass  # grounding image unavailable — skip this phase
+
+                # --- Phase 3: Live execution (wide-angle, robot + object in frame) ---
                 self.sim_env.start_recording()
 
             best_grasp = grasps[0]
@@ -375,8 +410,9 @@ class AffordGraspPipeline:
             
             if record_video:
                 self.sim_env.stop_recording()
-                video_path = os.path.join(trial_dir, "grasp_video.mp4")
+                video_path = os.path.join(trial_dir, "demo_video.mp4")
                 self.sim_env.save_video(video_path)
+                print(f"  Demo video saved: {video_path}")
 
             results["success"] = success
             results["grasp_executed"] = {
