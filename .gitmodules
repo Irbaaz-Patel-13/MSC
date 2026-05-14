@@ -1,7 +1,9 @@
 [submodule "contact_graspnet_pytorch"]
 	url = https://github.com/Irbaaz-Patel-13/contact_graspnet_pytorch.git
+	path = contact_graspnet_pytorch
 [submodule "hsr_description"]
 	url = https://github.com/Irbaaz-Patel-13/hsr_description.git
+	path = hsr_description
 [submodule "YCB_Dataset"]
 	path = YCB_Dataset
 	url = https://github.com/Irbaaz-Patel-13/YCB_Dataset.git
